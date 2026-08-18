@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -49,8 +50,26 @@ class AutoSwitchService : Service() {
         super.onCreate()
         p = Prefs(this)
         createChannel()
-        startForeground(NOTIF_ID, buildNotification("키보드 연결 해제 감시 중"))
-        registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED))
+
+        // API 29+ 는 포그라운드 타입을 명시해야 하고, API 34 에서는 누락 시 예외가 난다.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID,
+                buildNotification("키보드 연결 해제 감시 중"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification("키보드 연결 해제 감시 중"))
+        }
+
+        // API 34+ 는 리시버 등록 시 export 여부를 반드시 지정해야 한다.
+        // 시스템 브로드캐스트만 받으므로 NOT_EXPORTED 가 맞다.
+        val filter = IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY

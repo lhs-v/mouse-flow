@@ -249,22 +249,27 @@ function Write-Head([string]$t) {
     Write-Host ("=" * 74) -ForegroundColor DarkGray
 }
 
+function Get-LogitechVendorCollections {
+    # 로지텍의 모든 벤더 콜렉션 (진단 표시용)
+    [LogiHid]::Enumerate([uint16]$Config.VendorId) | Where-Object { $_.UsagePage -ge 0xFF00 }
+}
+
 function Get-HidppCollections {
-    # 로지텍 벤더 콜렉션 (usage page 0xFF00 이상)만 추린다.
-    # HID++ long report = 20바이트, short report = 7바이트.
-    $all = [LogiHid]::Enumerate([uint16]$Config.VendorId)
-    $all | Where-Object { $_.UsagePage -ge 0xFF00 } |
-        Sort-Object -Property @{ Expression = { $_.OutLen } } -Descending
+    # HID++ 리포트 크기는 long=20바이트, short=7바이트로 고정이다.
+    # 그 외 크기의 벤더 콜렉션(G-Series 등)은 다른 프로토콜이므로 반드시 제외해야 한다.
+    # 사용 페이지는 Unifying/Bolt 리시버가 0xFF00, BLE 직결이 0xFF43 을 쓴다.
+    Get-LogitechVendorCollections |
+        Where-Object { $_.OutLen -eq 20 -or $_.OutLen -eq 7 } |
+        Sort-Object -Property `
+            @{ Expression = { if ($_.UsagePage -eq 0xFF00 -or $_.UsagePage -eq 0xFF43) { 0 } else { 1 } } },
+            @{ Expression = { if ($_.OutLen -eq 20) { 0 } else { 1 } } }
 }
 
 function Select-HidppPath {
     if ($Config.ForceHidPath) { return $Config.ForceHidPath }
-    $c = Get-HidppCollections
-    if (-not $c) { return $null }
-    # long report(20B) 콜렉션 우선
-    $long = $c | Where-Object { $_.OutLen -ge 20 } | Select-Object -First 1
-    if ($long) { return $long.Path }
-    return ($c | Select-Object -First 1).Path
+    $c = Get-HidppCollections | Select-Object -First 1
+    if ($c) { return $c.Path }
+    return $null
 }
 
 function Invoke-Hidpp {
@@ -277,12 +282,15 @@ function Invoke-Hidpp {
         [switch] $NoResponse,
         [int]    $TimeoutMs = 700
     )
-    $dev = (Get-HidppCollections | Where-Object { $_.Path -eq $Path } | Select-Object -First 1)
+    $dev = (Get-LogitechVendorCollections | Where-Object { $_.Path -eq $Path } | Select-Object -First 1)
     if (-not $dev) { throw "HID 콜렉션을 찾을 수 없습니다: $Path" }
 
     $outLen = $dev.OutLen
     $inLen  = $dev.InLen
-    if ($outLen -lt 7) { throw "출력 리포트 길이가 비정상입니다 ($outLen)." }
+    # HID++ 가 아닌 콜렉션에 쏘면 조용히 무시당하므로 여기서 걸러낸다.
+    if ($outLen -ne 7 -and $outLen -ne 20) {
+        throw "HID++ 콜렉션이 아닙니다 (출력 리포트 $outLen 바이트). HID++ 는 7 또는 20 바이트여야 합니다."
+    }
 
     $swId = [byte]($Config.SoftwareId -band 0x0F)
     $buf  = New-Object byte[] $outLen
@@ -366,37 +374,56 @@ if ($ListBluetooth) {
 }
 
 if ($Discover) {
-    Write-Head '1) 로지텍 HID++ 콜렉션'
-    $cols = Get-HidppCollections
-    if (-not $cols) {
-        Write-Host '  로지텍 벤더 HID 콜렉션이 없습니다.' -ForegroundColor Red
+    Write-Head '1) 로지텍 벤더 HID 콜렉션'
+    $all = Get-LogitechVendorCollections
+    if (-not $all) {
+        Write-Host '  로지텍 벤더 HID 콜렉션이 하나도 없습니다.' -ForegroundColor Red
         Write-Host '  -> Unifying/Bolt 리시버가 꽂혀 있지 않거나, 마우스가 블루투스로 연결되어 있습니다.' -ForegroundColor Red
         Write-Host '     이 경우 PC 쪽 자동 전환은 불가능합니다 (폰 앱 경로만 가능).' -ForegroundColor Red
         return
     }
-    $cols | ForEach-Object {
-        Write-Host ("  PID=0x{0:X4}  UsagePage=0x{1:X4} Usage=0x{2:X4}  in={3} out={4}" -f $_.Pid, $_.UsagePage, $_.Usage, $_.InLen, $_.OutLen)
+
+    $cands = @(Get-HidppCollections)
+    $candPaths = @($cands | ForEach-Object { $_.Path })
+
+    $all | ForEach-Object {
+        $isCand = $candPaths -contains $_.Path
+        $mark  = if ($isCand) { 'HID++ 후보' } else { '제외 (HID++ 리포트 크기 아님)' }
+        $color = if ($isCand) { 'Green' } else { 'DarkGray' }
+        Write-Host ("  PID=0x{0:X4}  UsagePage=0x{1:X4} Usage=0x{2:X4}  in={3} out={4}   {5}" -f `
+                    $_.Pid, $_.UsagePage, $_.Usage, $_.InLen, $_.OutLen, $mark) -ForegroundColor $color
         Write-Host ("      $($_.Path)") -ForegroundColor DarkGray
     }
-    $path = Select-HidppPath
-    Write-Host ''
-    Write-Host "  선택된 콜렉션: $path" -ForegroundColor Cyan
 
-    Write-Head '2) 리시버에 물린 장치 슬롯 탐색 (1~6)'
+    if ($cands.Count -eq 0) {
+        Write-Host ''
+        Write-Host '  HID++ 콜렉션이 없습니다. 위 기기들은 전부 다른 벤더 프로토콜입니다.' -ForegroundColor Red
+        Write-Host '  (HID++ 는 출력 리포트가 정확히 20바이트 또는 7바이트입니다.)' -ForegroundColor Yellow
+        Write-Host '  -> MX Vertical 의 Unifying/Bolt 리시버를 꽂고 다시 실행하세요.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Head '2) 장치 슬롯 탐색 (콜렉션 x 슬롯 1~6, 0xFF)'
     $found = @()
-    foreach ($idx in 1..6) {
-        try {
-            $fi = Get-FeatureIndex -Path $path -DeviceIndex ([byte]$idx)
-        } catch { $fi = 0 }
-        if ($fi -ne 0) {
-            $info = $null
-            try { $info = Get-CurrentHost -Path $path -DeviceIndex ([byte]$idx) -FeatureIndex ([byte]$fi) } catch { }
-            $cur = if ($info) { "호스트 $($info.CurrentHost) / 총 $($info.NbHost)개" } else { '조회 실패' }
-            Write-Host ("  [슬롯 $idx]  ChangeHost 지원  featureIndex=0x{0:X2}   현재: $cur" -f $fi) -ForegroundColor Green
-            $found += [pscustomobject]@{ Index = $idx; Feature = $fi }
-        } else {
-            Write-Host "  [슬롯 $idx]  응답 없음" -ForegroundColor DarkGray
+    $usedPath = $null
+
+    foreach ($c in $cands) {
+        Write-Host ("  콜렉션 UsagePage=0x{0:X4} out={1}" -f $c.UsagePage, $c.OutLen) -ForegroundColor Cyan
+        foreach ($idx in @(1, 2, 3, 4, 5, 6, 0xFF)) {
+            try { $fi = Get-FeatureIndex -Path $c.Path -DeviceIndex ([byte]$idx) } catch { $fi = 0 }
+            $label = if ($idx -eq 0xFF) { '0xFF(직결)' } else { "슬롯 $idx" }
+            if ($fi -ne 0) {
+                $info = $null
+                try { $info = Get-CurrentHost -Path $c.Path -DeviceIndex ([byte]$idx) -FeatureIndex ([byte]$fi) } catch { }
+                $cur = if ($info) { "현재 호스트 $($info.CurrentHost) / 총 $($info.NbHost)개" } else { '호스트 조회 실패' }
+                Write-Host ("    [$label]  ChangeHost 지원  featureIndex=0x{0:X2}   $cur" -f $fi) -ForegroundColor Green
+                $found += [pscustomobject]@{ Index = $idx; Feature = $fi; Path = $c.Path }
+                if (-not $usedPath) { $usedPath = $c.Path }
+            } else {
+                Write-Host "    [$label]  응답 없음" -ForegroundColor DarkGray
+            }
         }
+        if ($found.Count -gt 0) { break }
     }
 
     Write-Head '3) 설정에 넣을 값'
@@ -408,7 +435,9 @@ if ($Discover) {
         Write-Host ("    MouseDeviceIndex = {0}" -f $f.Index) -ForegroundColor Yellow
         Write-Host ("    FeatureIndex     = 0x{0:X2}" -f $f.Feature) -ForegroundColor Yellow
         if ($found.Count -gt 1) {
-            Write-Host '  (여러 개 발견 — 키보드도 리시버에 물려 있을 수 있습니다. 마우스 슬롯을 고르세요.)' -ForegroundColor DarkYellow
+            Write-Host ''
+            Write-Host '  여러 개 발견 — 키보드도 리시버에 물려 있을 수 있습니다.' -ForegroundColor DarkYellow
+            Write-Host '  각 슬롯으로 -SwitchTo 를 시험해서 마우스가 반응하는 쪽을 고르세요.' -ForegroundColor DarkYellow
         }
     }
     return
@@ -432,7 +461,12 @@ if ($MonitorKeyboard) {
 if ($PSCmdlet.ParameterSetName -eq 'SwitchTo') {
     if ($SwitchTo -lt 0 -or $SwitchTo -gt 2) { throw '-SwitchTo 는 0, 1, 2 중 하나여야 합니다 (0-based 호스트 인덱스).' }
     Write-Head "즉시 전환 -> 호스트 $SwitchTo (Easy-Switch 채널 $($SwitchTo + 1))"
-    Send-ChangeHost -HostIndex $SwitchTo
+    try {
+        Send-ChangeHost -HostIndex $SwitchTo
+    } catch {
+        Write-Host ("  실패: " + $_.Exception.Message) -ForegroundColor Red
+        Write-Host '  -> .\LogiSwitch.ps1 -Discover 로 상태를 먼저 확인하세요.' -ForegroundColor Yellow
+    }
     return
 }
 
