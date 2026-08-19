@@ -114,12 +114,17 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
     var lastWriteRc: Int = -1
         private set
 
+    /** 마지막 쓰기의 GATT status. 0 = 성공, 13 = INVALID_ATTRIBUTE_LENGTH */
+    var lastWriteStatus: Int = -1
+        private set
+
     private val connQ = LinkedBlockingQueue<Boolean>()
     private val discQ = LinkedBlockingQueue<Boolean>()
     private val writeAckQ = LinkedBlockingQueue<Int>()
     private val descAckQ = LinkedBlockingQueue<Boolean>()
     private val notifyQ = LinkedBlockingQueue<ByteArray>()
     private val readQ = LinkedBlockingQueue<Pair<Int, ByteArray>>()
+    private val mtuQ = LinkedBlockingQueue<Int>()
 
     private val cb = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -130,6 +135,10 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
                     notifyQ.offer(ByteArray(0))   // 대기 중인 request 를 깨운다
                 }
             }
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            mtuQ.offer(if (status == BluetoothGatt.GATT_SUCCESS) mtu else -1)
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
@@ -180,6 +189,16 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         val ok = discQ.poll(timeoutMs, TimeUnit.MILLISECONDS)
         if (ok != true) { log("서비스 탐색 실패"); close(); return false }
         return true
+    }
+
+    /** ATT MTU 를 키운다. 기본 23 이면 쓰기 페이로드가 20바이트로 제한된다. */
+    fun negotiateMtu(target: Int = 247): Int {
+        val g = gatt ?: return -1
+        mtuQ.clear()
+        if (!g.requestMtu(target)) { log("requestMtu 호출 실패"); return -1 }
+        val m = mtuQ.poll(4000, TimeUnit.MILLISECONDS) ?: -1
+        log("ATT MTU = $m (쓰기 가능 최대 ${if (m > 3) m - 3 else 0} 바이트)")
+        return m
     }
 
     fun services(): List<BluetoothGattService> = gatt?.services ?: emptyList()
@@ -279,6 +298,7 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         val c = writeChar ?: return null
 
         notifyQ.clear(); writeAckQ.clear()
+        lastWriteStatus = -1; lastWriteRc = -1
         val type = if (writeTypeOverride >= 0) writeTypeOverride
         else if (c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0)
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
@@ -307,8 +327,10 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
 
         if (type == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) {
             val st = writeAckQ.poll(3000, TimeUnit.MILLISECONDS)
+            lastWriteStatus = st ?: -1
             when {
                 st == null -> log("  write ACK 없음 (타임아웃)")
+                st == 13 -> log("  write 실패 status=13 INVALID_ATTRIBUTE_LENGTH (길이 ${payload.size} 거부)")
                 st != BluetoothGatt.GATT_SUCCESS -> log("  write 실패 status=$st")
             }
         }

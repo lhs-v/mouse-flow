@@ -280,16 +280,18 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 프레이밍이 문서화돼 있지 않으므로 가능한 조합을 전부 시도한다.
-     *   장치 인덱스 0xFF(직결) / 0x01
-     *   long(20B) / short(7B)
-     *   리포트 ID 포함 / 미포함
-     *   WRITE / WRITE_NO_RESPONSE
-     * 응답이 알림으로 안 올 수도 있으므로 매번 특성 read 도 같이 해 본다.
+     * 1단계: 어떤 쓰기 길이를 받아주는지 찾는다 (status 13 = INVALID_ATTRIBUTE_LENGTH).
+     * 2단계: 받아주는 길이에 대해서만 프레이밍 조합을 시도한다.
+     *
+     * 응답 판정은 엄격하게 한다. 쓰기가 실패했으면 응답을 볼 것도 없고,
+     * 특성 read 는 쓰기 전 기준값과 "달라졌을 때"만 응답으로 인정한다.
+     * (기준값을 응답으로 오해해서 가짜 feature index 를 잡은 적이 있다)
      */
     private fun doSweep() {
         persist()
         if (p.mouseMac.isBlank()) { log("마우스를 먼저 선택하세요"); return }
+        p.featureIndex = 0
+        runOnUiThread { featEdit.setText("") }
 
         io.execute {
             val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -298,92 +300,94 @@ class MainActivity : Activity() {
             val ble = HidppBle(this) { log(it) }
             try {
                 if (!ble.connect(adapter.getRemoteDevice(p.mouseMac))) return@execute
+                ble.negotiateMtu(247)
 
                 val svc = UUID.fromString(p.serviceUuid)
                 val w = p.writeCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 if (!ble.bind(svc, w, n)) return@execute
 
-                // HID 서비스(0x1812) 진단은 절대 여기서 하지 않는다.
-                // readCharacteristic 이 SecurityException 을 던지면 프레임워크의
-                // mDeviceBusy 가 true 로 고정돼 이후 모든 GATT 작업이 막힌다.
-                // 차단된다는 사실은 이미 실기로 확인됐다.
-                log("")
-                log("(HID 서비스 0x1812 는 BLUETOOTH_PRIVILEGED 필요 - 확인 완료, 건너뜀)")
-
                 val vendorChar = w ?: ble.characteristicsOf(svc).firstOrNull()?.uuid
-                if (vendorChar != null) {
-                    log("")
-                    log("=== 쓰기 전 벤더 특성 내용 ===")
-                    val before = ble.read(svc, vendorChar)
-                    log(if (before != null) "  ${Hidpp.hex(before)}" else "  (읽기 실패)")
+                val baseline = vendorChar?.let { ble.read(svc, it) }
+                log("")
+                log("기준값(쓰기 전): " + (baseline?.let { Hidpp.hex(it) } ?: "(읽기 실패)"))
+                log("기준값 길이: ${baseline?.size ?: -1} 바이트")
+
+                // ---------- 1단계: 허용되는 쓰기 길이 찾기 ----------
+                log("")
+                log("=== 1단계: 허용 쓰기 길이 탐색 ===")
+                val accepted = ArrayList<Int>()
+                for (len in 2..20) {
+                    val probe = ByteArray(len)
+                    val src = Hidpp.packet(0xFF, 0x00, 0x00,
+                        intArrayOf((Hidpp.FEATURE_CHANGE_HOST shr 8) and 0xFF,
+                                   Hidpp.FEATURE_CHANGE_HOST and 0xFF), true, true)
+                    for (i in 0 until minOf(len, src.size)) probe[i] = src[i]
+
+                    try { ble.request(probe, 0) } catch (e: Exception) { }
+                    val st = ble.lastWriteStatus
+                    if (st == 0) { accepted.add(len); log("  길이 $len : 허용") }
+                    else if (st != 13) log("  길이 $len : status=$st")
+                    Thread.sleep(120)
                 }
 
+                if (accepted.isEmpty()) {
+                    log("")
+                    log("2~20 바이트 중 허용되는 길이가 없습니다.")
+                    log("이 특성은 HID++ 명령 통로가 아닐 가능성이 큽니다.")
+                    return@execute
+                }
+                log("허용 길이: ${accepted.joinToString(", ")}")
+
+                // ---------- 2단계: 허용 길이에서만 프레이밍 시도 ----------
                 log("")
-                log("=== 조합 탐색 (16가지) ===")
+                log("=== 2단계: 프레이밍 조합 ===")
                 var hit = false
 
-                for (devIdx in intArrayOf(0xFF, 0x01)) {
-                    for (isLong in booleanArrayOf(true, false)) {
+                for (len in accepted) {
+                    for (devIdx in intArrayOf(0xFF, 0x01)) {
                         for (withId in booleanArrayOf(true, false)) {
-                            for (wt in intArrayOf(
-                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                            )) {
-                                if (hit) continue
-                                val kind = if (isLong) "long" else "short"
-                                val wtName = if (wt == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) "WRITE" else "WRITE_NR"
-                                val label = "devIdx=0x%02X %s rptId=%s %s".format(devIdx, kind, withId, wtName)
-                                log("-- $label")
+                            if (hit) continue
+                            val label = "len=$len devIdx=0x%02X rptId=%s".format(devIdx, withId)
 
-                                val pkt = Hidpp.packet(
-                                    devIdx, 0x00, 0x00,
-                                    intArrayOf(
-                                        (Hidpp.FEATURE_CHANGE_HOST shr 8) and 0xFF,
-                                        Hidpp.FEATURE_CHANGE_HOST and 0xFF
-                                    ),
-                                    isLong, withId
-                                )
+                            val src = Hidpp.packet(devIdx, 0x00, 0x00,
+                                intArrayOf((Hidpp.FEATURE_CHANGE_HOST shr 8) and 0xFF,
+                                           Hidpp.FEATURE_CHANGE_HOST and 0xFF), true, withId)
+                            val pkt = ByteArray(len)
+                            for (i in 0 until minOf(len, src.size)) pkt[i] = src[i]
 
-                                var resp = try { ble.request(pkt, 1200, wt) } catch (e: Exception) {
-                                    log("  예외: ${e.javaClass.simpleName}"); null
+                            log("-- $label")
+                            var resp = try { ble.request(pkt, 1500) } catch (e: Exception) { null }
+
+                            // 쓰기가 실패했으면 응답을 볼 이유가 없다
+                            if (ble.lastWriteStatus != 0) continue
+
+                            // 알림이 없으면 read 로 확인하되, 기준값과 달라야 응답이다
+                            if (resp == null && vendorChar != null) {
+                                val rd = try { ble.read(svc, vendorChar, 1200) } catch (e: Exception) { null }
+                                if (rd != null && baseline != null && !rd.contentEquals(baseline)) {
+                                    log("  READ 변화: ${Hidpp.hex(rd)}")
+                                    resp = rd
                                 }
+                            }
 
-                                // GATT 큐가 막혔으면 연결을 새로 맺고 이 조합만 한 번 더
-                                if (resp == null && ble.lastWriteRc == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY) {
-                                    log("  큐가 막혀 재연결합니다")
-                                    ble.close()
-                                    Thread.sleep(400)
-                                    if (ble.connect(adapter.getRemoteDevice(p.mouseMac)) && ble.bind(svc, w, n)) {
-                                        resp = try { ble.request(pkt, 1200, wt) } catch (e: Exception) { null }
-                                    }
-                                }
+                            if (resp == null) { log("  쓰기 성공, 응답 없음"); continue }
 
-                                // 알림이 안 오면 특성을 읽어서 응답이 거기 있는지 본다
-                                if (resp == null && vendorChar != null) {
-                                    val rd = try { ble.read(svc, vendorChar, 1200) } catch (e: Exception) { null }
-                                    if (rd != null && rd.any { it.toInt() != 0 }) {
-                                        log("  READ  ${Hidpp.hex(rd)}")
-                                        resp = rd
-                                    }
-                                }
-
-                                if (resp != null) {
-                                    val nrm = Hidpp.normalize(resp)
-                                    val feat = nrm.getOrNull(3)?.toInt()?.and(0xFF) ?: 0
-                                    if (Hidpp.isError(nrm)) {
-                                        log("  ★ 오류 응답 code=${Hidpp.errorCode(nrm)} — 프레이밍은 맞고 요청 내용이 틀림")
-                                    } else if (feat != 0) {
-                                        log("  ★★ 성공!  $label")
-                                        log("     ChangeHost feature index = 0x%02X".format(feat))
-                                        p.featureIndex = feat
-                                        p.includeReportId = withId
-                                        hit = true
-                                        runOnUiThread {
-                                            featEdit.setText("%02X".format(feat))
-                                            rptCheck.isChecked = withId
-                                        }
-                                    }
+                            val nrm = Hidpp.normalize(resp)
+                            if (Hidpp.isError(nrm)) {
+                                log("  ★ 오류 응답 code=${Hidpp.errorCode(nrm)} — 프레이밍 정답, 요청 내용만 틀림")
+                                continue
+                            }
+                            val feat = nrm.getOrNull(3)?.toInt()?.and(0xFF) ?: 0
+                            if (feat != 0) {
+                                log("  ★★ 성공!  $label")
+                                log("     ChangeHost feature index = 0x%02X".format(feat))
+                                p.featureIndex = feat
+                                p.includeReportId = withId
+                                hit = true
+                                runOnUiThread {
+                                    featEdit.setText("%02X".format(feat))
+                                    rptCheck.isChecked = withId
                                 }
                             }
                         }
@@ -391,15 +395,10 @@ class MainActivity : Activity() {
                 }
 
                 log("")
-                if (hit) {
-                    log("성공. 설정을 저장했습니다. 이제 [지금 전환] 을 누르세요.")
-                } else {
-                    log("모든 조합 무응답.")
-                    log("위 로그에서 확인할 것:")
-                    log(" 1) '알림 구독 ... 실패' 가 있는지 — 응답 통로가 아예 없다는 뜻")
-                    log(" 2) 'write 실패 status=' 가 있는지 — 쓰기가 거부되는 것")
-                    log(" 3) 'HID 서비스 접근' 결과")
-                    log("이 세 줄을 알려주시면 다음 수를 정할 수 있습니다.")
+                if (hit) log("성공. 이제 [지금 전환] 을 누르세요.")
+                else {
+                    log("쓰기는 통했지만 응답이 없습니다.")
+                    log("허용 길이(${accepted.joinToString(",")})와 기준값을 알려주세요.")
                 }
             } catch (e: Exception) {
                 log("예외: ${e.message}")
