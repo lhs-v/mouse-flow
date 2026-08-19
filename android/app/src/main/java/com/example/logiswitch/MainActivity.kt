@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
@@ -138,6 +139,7 @@ class MainActivity : Activity() {
         hostEdit = EditText(this).apply { setSingleLine(); textSize = 12f }
         root.addView(hostEdit)
 
+        button("전체 조합 자동 탐색  ★ 먼저 이걸 누르세요") { doSweep() }
         button("Feature Index 조회") { doProbeFeature() }
         button("지금 전환") { doSwitch() }
 
@@ -251,7 +253,7 @@ class MainActivity : Activity() {
             try {
                 if (!ble.connect(adapter.getRemoteDevice(p.mouseMac))) return@execute
                 val svc = UUID.fromString(p.serviceUuid)
-                val w = UUID.fromString(p.writeCharUuid.ifBlank { throw IllegalStateException("쓰기 특성을 고르세요") })
+                val w = p.writeCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 if (!ble.bind(svc, w, n)) return@execute
 
@@ -276,6 +278,121 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * 프레이밍이 문서화돼 있지 않으므로 가능한 조합을 전부 시도한다.
+     *   장치 인덱스 0xFF(직결) / 0x01
+     *   long(20B) / short(7B)
+     *   리포트 ID 포함 / 미포함
+     *   WRITE / WRITE_NO_RESPONSE
+     * 응답이 알림으로 안 올 수도 있으므로 매번 특성 read 도 같이 해 본다.
+     */
+    private fun doSweep() {
+        persist()
+        if (p.mouseMac.isBlank()) { log("마우스를 먼저 선택하세요"); return }
+
+        io.execute {
+            val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+            if (adapter == null || !adapter.isEnabled) { log("블루투스가 꺼져 있습니다"); return@execute }
+
+            val ble = HidppBle(this) { log(it) }
+            try {
+                if (!ble.connect(adapter.getRemoteDevice(p.mouseMac))) return@execute
+
+                val svc = UUID.fromString(p.serviceUuid)
+                val w = p.writeCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
+                val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
+                if (!ble.bind(svc, w, n)) return@execute
+
+                log("")
+                log("=== HID 서비스 접근 가능 여부 ===")
+                ble.probeHidService()
+
+                val vendorChar = w ?: ble.characteristicsOf(svc).firstOrNull()?.uuid
+                if (vendorChar != null) {
+                    log("")
+                    log("=== 쓰기 전 벤더 특성 내용 ===")
+                    val before = ble.read(svc, vendorChar)
+                    log(if (before != null) "  ${Hidpp.hex(before)}" else "  (읽기 실패)")
+                }
+
+                log("")
+                log("=== 조합 탐색 (16가지) ===")
+                var hit = false
+
+                for (devIdx in intArrayOf(0xFF, 0x01)) {
+                    for (isLong in booleanArrayOf(true, false)) {
+                        for (withId in booleanArrayOf(true, false)) {
+                            for (wt in intArrayOf(
+                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                            )) {
+                                if (hit) continue
+                                val kind = if (isLong) "long" else "short"
+                                val wtName = if (wt == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) "WRITE" else "WRITE_NR"
+                                val label = "devIdx=0x%02X %s rptId=%s %s".format(devIdx, kind, withId, wtName)
+                                log("-- $label")
+
+                                val pkt = Hidpp.packet(
+                                    devIdx, 0x00, 0x00,
+                                    intArrayOf(
+                                        (Hidpp.FEATURE_CHANGE_HOST shr 8) and 0xFF,
+                                        Hidpp.FEATURE_CHANGE_HOST and 0xFF
+                                    ),
+                                    isLong, withId
+                                )
+
+                                var resp = ble.request(pkt, 1200, wt)
+
+                                // 알림이 안 오면 특성을 읽어서 응답이 거기 있는지 본다
+                                if (resp == null && vendorChar != null) {
+                                    val rd = ble.read(svc, vendorChar, 1200)
+                                    if (rd != null && rd.any { it.toInt() != 0 }) {
+                                        log("  READ  ${Hidpp.hex(rd)}")
+                                        resp = rd
+                                    }
+                                }
+
+                                if (resp != null) {
+                                    val nrm = Hidpp.normalize(resp)
+                                    val feat = nrm.getOrNull(3)?.toInt()?.and(0xFF) ?: 0
+                                    if (Hidpp.isError(nrm)) {
+                                        log("  ★ 오류 응답 code=${Hidpp.errorCode(nrm)} — 프레이밍은 맞고 요청 내용이 틀림")
+                                    } else if (feat != 0) {
+                                        log("  ★★ 성공!  $label")
+                                        log("     ChangeHost feature index = 0x%02X".format(feat))
+                                        p.featureIndex = feat
+                                        p.includeReportId = withId
+                                        hit = true
+                                        runOnUiThread {
+                                            featEdit.setText("%02X".format(feat))
+                                            rptCheck.isChecked = withId
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                log("")
+                if (hit) {
+                    log("성공. 설정을 저장했습니다. 이제 [지금 전환] 을 누르세요.")
+                } else {
+                    log("모든 조합 무응답.")
+                    log("위 로그에서 확인할 것:")
+                    log(" 1) '알림 구독 ... 실패' 가 있는지 — 응답 통로가 아예 없다는 뜻")
+                    log(" 2) 'write 실패 status=' 가 있는지 — 쓰기가 거부되는 것")
+                    log(" 3) 'HID 서비스 접근' 결과")
+                    log("이 세 줄을 알려주시면 다음 수를 정할 수 있습니다.")
+                }
+            } catch (e: Exception) {
+                log("예외: ${e.message}")
+            } finally {
+                ble.close()
+            }
+        }
+    }
+
     private fun doSwitch() {
         persist()
         io.execute { SwitchOp.run(this, p) { log(it) } }
@@ -291,7 +408,8 @@ class MainActivity : Activity() {
             try {
                 if (!ble.connect(adapter.getRemoteDevice(p.mouseMac))) return@execute
                 val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
-                if (!ble.bind(UUID.fromString(p.serviceUuid), UUID.fromString(p.writeCharUuid), n)) return@execute
+                val w = p.writeCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
+                if (!ble.bind(UUID.fromString(p.serviceUuid), w, n)) return@execute
                 ble.request(bytes, 2500)
             } catch (e: Exception) {
                 log("예외: ${e.message}")

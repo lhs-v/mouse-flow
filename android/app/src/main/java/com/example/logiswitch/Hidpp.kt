@@ -40,15 +40,26 @@ object Hidpp {
 
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    fun report(devIdx: Int, featIdx: Int, funcId: Int, params: IntArray, includeReportId: Boolean): ByteArray {
-        val full = ByteArray(20)
-        full[0] = 0x11
+    /**
+     * HID++ 패킷 조립.
+     * long  = 20바이트, 리포트 ID 0x11
+     * short =  7바이트, 리포트 ID 0x10
+     * includeReportId=false 면 맨 앞 바이트를 뗀다 (19 / 6바이트).
+     */
+    fun packet(devIdx: Int, featIdx: Int, funcId: Int, params: IntArray,
+               longReport: Boolean, includeReportId: Boolean): ByteArray {
+        val size = if (longReport) 20 else 7
+        val full = ByteArray(size)
+        full[0] = if (longReport) 0x11 else 0x10
         full[1] = (devIdx and 0xFF).toByte()
         full[2] = (featIdx and 0xFF).toByte()
         full[3] = (((funcId and 0x0F) shl 4) or (SW_ID and 0x0F)).toByte()
-        for (i in params.indices) if (4 + i < 20) full[4 + i] = (params[i] and 0xFF).toByte()
-        return if (includeReportId) full else full.copyOfRange(1, 20)
+        for (i in params.indices) if (4 + i < size) full[4 + i] = (params[i] and 0xFF).toByte()
+        return if (includeReportId) full else full.copyOfRange(1, size)
     }
+
+    fun report(devIdx: Int, featIdx: Int, funcId: Int, params: IntArray, includeReportId: Boolean): ByteArray =
+        packet(devIdx, featIdx, funcId, params, true, includeReportId)
 
     /** Root(0x0000).getFeature(featureId) */
     fun rootGetFeature(featureId: Int, includeReportId: Boolean): ByteArray =
@@ -101,9 +112,10 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
 
     private val connQ = LinkedBlockingQueue<Boolean>()
     private val discQ = LinkedBlockingQueue<Boolean>()
-    private val writeAckQ = LinkedBlockingQueue<Boolean>()
+    private val writeAckQ = LinkedBlockingQueue<Int>()
     private val descAckQ = LinkedBlockingQueue<Boolean>()
     private val notifyQ = LinkedBlockingQueue<ByteArray>()
+    private val readQ = LinkedBlockingQueue<Pair<Int, ByteArray>>()
 
     private val cb = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -121,7 +133,7 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
-            writeAckQ.offer(status == BluetoothGatt.GATT_SUCCESS)
+            writeAckQ.offer(status)
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
@@ -136,6 +148,16 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
 
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
             notifyQ.offer(value.copyOf())
+        }
+
+        @Deprecated("API 32 이하에서 호출됨")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            @Suppress("DEPRECATION")
+            readQ.offer(Pair(status, c.value?.copyOf() ?: ByteArray(0)))
+        }
+
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            readQ.offer(Pair(status, value.copyOf()))
         }
     }
 
@@ -176,28 +198,58 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
     fun characteristicsOf(serviceUuid: UUID): List<BluetoothGattCharacteristic> =
         gatt?.getService(serviceUuid)?.characteristics ?: emptyList()
 
-    fun bind(serviceUuid: UUID, writeUuid: UUID, notifyUuid: UUID?): Boolean {
+    /**
+     * 쓰기/알림 특성을 결정하고 알림을 켠다.
+     * 인자가 null 이면 서비스 안에서 자동으로 고른다. 응답이 어디로 올지 모르므로
+     * NOTIFY/INDICATE 가 있는 특성은 전부 구독한다.
+     */
+    fun bind(serviceUuid: UUID, writeUuid: UUID?, notifyUuid: UUID?): Boolean {
         val g = gatt ?: return false
         val svc = g.getService(serviceUuid)
         if (svc == null) { log("서비스를 찾을 수 없음: $serviceUuid"); return false }
 
-        writeChar = svc.getCharacteristic(writeUuid)
-        if (writeChar == null) { log("쓰기 특성을 찾을 수 없음: $writeUuid"); return false }
+        val writable = svc.characteristics.filter {
+            it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                               BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+        }
+        writeChar = when {
+            writeUuid != null -> svc.getCharacteristic(writeUuid)
+            writable.size == 1 -> writable[0].also { log("쓰기 특성 자동 선택: ${it.uuid}") }
+            else -> null
+        }
+        if (writeChar == null) {
+            log("쓰기 특성을 정하지 못했습니다 (후보 ${writable.size}개). 목록에서 직접 고르세요.")
+            return false
+        }
+        log("쓰기 특성: ${writeChar!!.uuid} [${propNames(writeChar!!.properties)}]")
 
-        if (notifyUuid != null) {
-            val nc = svc.getCharacteristic(notifyUuid)
-            if (nc == null) {
-                log("알림 특성을 찾을 수 없음: $notifyUuid — 응답 없이 진행")
-            } else if (!enableNotify(g, nc)) {
-                log("알림 활성화 실패 — 응답 없이 진행")
+        // 알림 대상: 지정됐으면 그것만, 아니면 구독 가능한 전부
+        val notifyTargets = if (notifyUuid != null) {
+            listOfNotNull(svc.getCharacteristic(notifyUuid))
+        } else {
+            svc.characteristics.filter {
+                it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                                   BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
             }
+        }
+
+        if (notifyTargets.isEmpty()) {
+            log("경고: 구독할 알림 특성이 없습니다. 응답을 받을 수 없습니다.")
+        }
+        for (nc in notifyTargets) {
+            val ok = enableNotify(g, nc)
+            log("알림 구독 ${nc.uuid} -> " + if (ok) "성공" else "실패")
         }
         return true
     }
 
     private fun enableNotify(g: BluetoothGatt, c: BluetoothGattCharacteristic): Boolean {
-        if (!g.setCharacteristicNotification(c, true)) return false
-        val d = c.getDescriptor(Hidpp.CCCD) ?: return false
+        if (!g.setCharacteristicNotification(c, true)) {
+            log("  setCharacteristicNotification 거부됨: ${c.uuid}")
+            return false
+        }
+        val d = c.getDescriptor(Hidpp.CCCD)
+        if (d == null) { log("  CCCD(0x2902) 디스크립터 없음: ${c.uuid}"); return false }
         val value = if (c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
             BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         else
@@ -218,12 +270,13 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
      * 페이로드를 쓰고 알림 응답을 기다린다.
      * waitMs <= 0 이면 응답을 기다리지 않는다 (setCurrentHost 는 응답이 오지 않음).
      */
-    fun request(payload: ByteArray, waitMs: Long): ByteArray? {
+    fun request(payload: ByteArray, waitMs: Long, writeTypeOverride: Int = -1): ByteArray? {
         val g = gatt ?: return null
         val c = writeChar ?: return null
 
         notifyQ.clear(); writeAckQ.clear()
-        val type = if (c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0)
+        val type = if (writeTypeOverride >= 0) writeTypeOverride
+        else if (c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0)
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         else
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -238,7 +291,11 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         if (!started) { log("  write 호출 거부됨"); return null }
 
         if (type == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) {
-            writeAckQ.poll(3000, TimeUnit.MILLISECONDS)
+            val st = writeAckQ.poll(3000, TimeUnit.MILLISECONDS)
+            when {
+                st == null -> log("  write ACK 없음 (타임아웃)")
+                st != BluetoothGatt.GATT_SUCCESS -> log("  write 실패 status=$st")
+            }
         }
         if (waitMs <= 0) return null
 
@@ -247,6 +304,42 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         if (r.isEmpty()) { log("  응답 없음 (링크 끊김)"); return null }
         log("  RX  ${Hidpp.hex(r)}")
         return r
+    }
+
+    /** 특성을 읽는다. 응답이 알림이 아니라 read 로 오는 경우를 잡기 위한 것. */
+    fun read(serviceUuid: UUID, charUuid: UUID, timeoutMs: Long = 2500): ByteArray? {
+        val g = gatt ?: return null
+        val c = g.getService(serviceUuid)?.getCharacteristic(charUuid) ?: return null
+        if (c.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) return null
+        readQ.clear()
+        if (!g.readCharacteristic(c)) { log("  read 호출 거부됨: $charUuid"); return null }
+        val r = readQ.poll(timeoutMs, TimeUnit.MILLISECONDS)
+        if (r == null) { log("  read 응답 없음"); return null }
+        if (r.first != BluetoothGatt.GATT_SUCCESS) { log("  read 실패 status=${r.first}"); return null }
+        return r.second
+    }
+
+    /**
+     * 안드로이드가 HID 서비스(0x1812) 접근을 막는지 실제로 확인한다.
+     * HOGP 에서 HID++ 가 원래 오가는 통로이므로, 열려 있다면 그쪽이 정답이다.
+     */
+    fun probeHidService() {
+        val g = gatt ?: return
+        val hid = g.getService(UUID.fromString("00001812-0000-1000-8000-00805f9b34fb"))
+        if (hid == null) { log("HID 서비스 없음"); return }
+        val target = hid.characteristics.firstOrNull {
+            it.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+        }
+        if (target == null) { log("HID 서비스에 읽을 특성 없음"); return }
+        readQ.clear()
+        val started = g.readCharacteristic(target)
+        if (!started) { log("HID 서비스 접근: 차단됨 (read 호출 자체를 거부)"); return }
+        val r = readQ.poll(2500, TimeUnit.MILLISECONDS)
+        when {
+            r == null -> log("HID 서비스 접근: 응답 없음")
+            r.first != BluetoothGatt.GATT_SUCCESS -> log("HID 서비스 접근: 거부 status=${r.first}")
+            else -> log("HID 서비스 접근: 허용됨! (${Hidpp.hex(r.second)})")
+        }
     }
 
     fun close() {
@@ -288,7 +381,10 @@ object SwitchOp {
             if (!ble.connect(dev)) return false
 
             val svcUuid = try { UUID.fromString(p.serviceUuid) } catch (e: Exception) { log("서비스 UUID 형식 오류"); return false }
-            val wUuid = try { UUID.fromString(p.writeCharUuid) } catch (e: Exception) { log("쓰기 특성 UUID를 먼저 지정하세요"); return false }
+            // 비워두면 bind() 가 서비스 안에서 자동으로 고른다
+            val wUuid = p.writeCharUuid.takeIf { it.isNotBlank() }?.let {
+                try { UUID.fromString(it) } catch (e: Exception) { null }
+            }
             val nUuid = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let {
                 try { UUID.fromString(it) } catch (e: Exception) { null }
             }
