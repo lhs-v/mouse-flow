@@ -313,7 +313,7 @@ $tray.Text = 'LogiSwitch'
 $tray.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('열기',   $null, { $form.Show(); $form.WindowState = 'Normal'; $form.Activate() })
-[void]$menu.Items.Add('끝내기', $null, { $script:Quitting = $true; $form.Close() })
+[void]$menu.Items.Add('끝내기', $null, { $form.Close() })
 $tray.ContextMenuStrip = $menu
 $tray.add_DoubleClick({ $form.Show(); $form.WindowState = 'Normal'; $form.Activate() })
 
@@ -444,7 +444,6 @@ $btnTray.add_Click({
 })
 
 # 닫기는 진짜 종료. 숨기려면 [트레이로 숨기기] 를 쓴다.
-$script:Quitting = $false
 $form.add_FormClosing({
     $timer.Stop()
     $sync.Stop = $true
@@ -469,7 +468,9 @@ $form.add_Shown({
     }
 })
 
-[void]$form.ShowDialog()
+# ShowDialog 는 폼을 Hide() 하면 루프가 끝나 앱이 통째로 종료된다.
+# Application.Run 은 폼이 '닫힐' 때만 끝나므로 트레이 숨김이 가능하다.
+[System.Windows.Forms.Application]::Run($form)
 
 # 정리
 $sync.Stop = $true
