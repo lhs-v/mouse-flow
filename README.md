@@ -1,202 +1,183 @@
 # mouse-flow
 
-독거미 키보드의 블루투스 채널 전환(`Fn+1` / `Fn+2`)에 **MX Vertical 마우스를 따라가게** 만드는 도구.
-로지텍의 Enhanced Easy-Switch를 직접 구현한 것으로, 로지텍 키보드가 아니어도 동작한다.
+독거미(AULA) 키보드의 블루투스 채널을 바꾸면 **MX Vertical 마우스가 따라오게** 만드는 도구.
+로지텍의 Enhanced Easy-Switch 를 직접 구현한 것이라 로지텍 키보드가 아니어도 동작한다.
 
-> **검증 상태** (2026-08-19, Galaxy Z Fold 7 / Android 16 SDK 36 실기 확인)
->
-> | 항목 | 결과 |
-> |---|---|
-> | PowerShell 전체 실행 경로 | ✅ Add-Type, HID 열거, CreateFile, 송신, 오버랩드 수신, 오류 처리 |
-> | HID++ 콜렉션 필터링 | ✅ 비-HID++ 로지텍 기기를 올바르게 제외 |
-> | Android 빌드 | ✅ `assembleDebug` 성공 |
-> | 앱 실행 / UI | ✅ 크래시 없음 |
-> | 런타임 권한 흐름 | ✅ 거부 → 허용 후 기기 목록 6개 로드 |
-> | GATT 연결 시도 | ✅ MX Vertical 대상, 부재 시 정상 타임아웃 (행/크래시 없음) |
-> | 포그라운드 서비스 | ✅ `isForeground=true`, `types=0x10 CONNECTED_DEVICE`, 예외 없음 |
-> | ACL_DISCONNECTED 리시버 | ✅ 등록 확인 (`#receivers=1`) |
-> | **ChangeHost 왕복 (PC)** | ❌ 미확인 — HID++ 기기 부재 |
-> | **벤더 GATT 쓰기 (폰)** | ❌ 미확인 — 마우스 부재 |
->
-> 즉 **배관은 전부 검증됐고, 마지막 한 단계씩만 실기 확인이 남았다.**
+> **상태: 양방향 자동 전환 동작 확인** (2026-08-19)
+> 사내망 Windows PC + Galaxy Z Fold 7 (Android 16) + MX Vertical + AULA F108 5.0
+
+```
+Fn+1  키보드 -> PC    :  폰 앱이 감지, 마우스를 PC 로 밀어냄
+Fn+2  키보드 -> 폰    :  PC 스크립트가 감지, 마우스를 폰으로 밀어냄
+```
+
+키 하나로 키보드와 마우스가 같이 넘어간다. 마우스를 들어 바닥 버튼을 누를 일이 없다.
 
 ---
 
-## 원리
+## 왜 양쪽에 프로그램이 필요한가
 
-Easy-Switch 버튼이 하는 일은 로지텍 독자 프로토콜 HID++ 의 **feature `0x1814` (ChangeHost)** 명령이다.
-소프트웨어로도 보낼 수 있다. Logi Options+ 가 UI 에 노출하지 않을 뿐이다.
+Easy-Switch 는 HID++ 의 **feature `0x1814` (ChangeHost)** 명령이다. 그런데 이 명령은
+**밀어내기만 되고 불러오기는 안 된다.** 명령이 성공하는 순간 무선 링크가 끊기므로
+응답조차 오지 않는다. 마우스가 폰에 있는 동안 PC 는 마우스와 통신할 방법이 아예 없다.
+
+그래서 "지금 마우스를 쥐고 있는 쪽"이 상대에게 넘겨주는 구조여야 한다.
+
+| 방향 | 감지 | 전송 |
+|---|---|---|
+| PC → 폰 | PowerShell 이 키보드의 BT 링크 해제를 감지 | Unifying 리시버로 HID++ ChangeHost |
+| 폰 → PC | 앱이 키보드 연결 상태를 폴링 | BLE 벤더 GATT 로 HID++ ChangeHost |
+
+---
+
+## 확인된 사실들
+
+이 프로젝트에서 실기로 알아낸 것들. 문서화된 자료가 없어 하나씩 측정했다.
+
+### BLE 벤더 GATT 프레임은 18바이트, 헤더가 없다
+
+로지텍 BLE 마우스는 GATT 서비스를 두 개 노출한다.
+
+| 서비스 | UUID | 앱 접근 |
+|---|---|---|
+| HID over GATT | `0x1812` | **불가** — `BLUETOOTH_PRIVILEGED` 필요 (실기 확인) |
+| 로지텍 독자 서비스 | `00010000-0000-1000-8000-011f2000046d` | 가능 — 일반 커스텀 서비스 |
+
+벤더 서비스에는 특성이 하나뿐이다: `00010001-...` `[READ/WRITE/WRITE_NR/NOTIFY]`
+
+이 특성이 받는 프레임은 **리포트 ID 도 장치 인덱스도 없다.**
 
 ```
-11 FF <featureIndex> <(funcId<<4)|swId> <hostIndex> 00 00 ...   (20바이트 long report)
-                     funcId=1 : setCurrentHost
-                                            hostIndex 는 0-based
-                                            0=채널1, 1=채널2, 2=채널3
+[0]     featureIndex
+[1]     (funcId << 4) | swId
+[2..17] parameters
+                          총 18바이트 고정
 ```
 
-핵심 제약이 하나 있다. **ChangeHost 는 밀어내기만 되고 불러오기는 안 된다.**
-명령이 성공하는 순간 무선 링크가 끊기므로 응답도 오지 않는다.
-그래서 양쪽에 각각 "밀어내는 쪽"을 두어야 한다.
+20바이트 long report 에서 앞 2바이트를 뺀 것이다. 19·20바이트를 쓰면
+`GATT_INVALID_ATTRIBUTE_LENGTH`(13) 로 거부된다.
 
-| 방향 | 조작 | 키보드 | 마우스 |
-|---|---|---|---|
-| PC → 폰 | `Fn+2` | 자체 전환 | **PC 의 PowerShell** 이 리시버로 ChangeHost(폰) |
-| 폰 → PC | `Fn+1` | 자체 전환 | **폰의 앱** 이 BLE 로 ChangeHost(PC) |
+**알아낸 방법**: `11 FF` 두 바이트만 써 봤더니 `FF 11 FF 07` 이 돌아왔다.
+HID++ 2.0 오류 프레임은 `FF <원래 featIdx> <원래 fn|sw> <에러코드>` 이고,
+보낸 두 바이트가 정확히 그 자리에 반사됐다. `07` 은 `INVALID_FUNCTION_ID`.
+
+### 실제 교환 내용
+
+```
+TX  00 0D 18 14 …    Root.getFeature(0x1814)
+RX  00 0D 0C 00 01   featureIndex=0x0C, type=0x00, version=1
+
+TX  0C 0D …          0x1814.getHostInfo()
+RX  0C 0D 03 01      호스트 3개, 현재 1 (0-based)
+
+TX  0C 1D 02 …       0x1814.setCurrentHost(2)
+RX  0C 1D 00         성공
+```
+
+`0C 1D` 에서 `1D` = `(funcId 1 << 4) | swId 0x0D`.
+
+### 감지 신호는 양쪽 다 직관과 다르다
+
+**PC**: 블루투스 LE 기기는 링크가 끊겨도 PnP 노드가 남고 `Status` 가 `OK` 를 유지한다.
+페어링 정보가 유지되기 때문이다. 그래서 `Status` 로는 판별할 수 없고 링크 상태를 따로 읽어야 한다.
+
+**폰**: `ACTION_ACL_DISCONNECTED` 브로드캐스트에만 의존하면 놓친다.
+1.5초 폴링으로 연결 상태를 직접 확인하는 쪽이 확실하다.
+`getConnectedDevices(GATT)` 와 숨은 `isConnected()` 둘 다 실제를 정확히 반영했다.
 
 ---
 
 ## 구성
 
 ```
-pc/LogiSwitch.ps1     Windows 감시 스크립트 (외부 실행파일 불필요, 관리자 권한 불필요)
+pc/LogiSwitch.ps1     Windows 감시 스크립트 (외부 실행파일·관리자 권한 불필요)
 android/              폰 앱 (설정 + 진단 + 자동 전환)
 ```
 
-### PC 쪽이 순수 PowerShell 인 이유
-
-흔히 쓰이는 `hidapitester.exe` 를 쓰지 않았다.
-
-- 망분리 PC 에서 GitHub 다운로드가 안 될 가능성이 높다
-- 미서명 서드파티 바이너리는 AppLocker/WDAC/백신에 걸린다
-
-대신 `hid.dll` / `setupapi.dll` 을 P/Invoke 로 직접 호출한다.
-HID 벤더 콜렉션(usage page `0xFF00` 이상)은 일반 사용자 권한으로 열 수 있다.
-
-### 폰 앱이 GATT 로 접근 가능한 이유
-
-로지텍 BLE 마우스는 GATT 서비스를 두 개 노출한다.
-
-| 서비스 | UUID | 앱 접근 |
-|---|---|---|
-| HID over GATT | `0x1812` | ❌ 시스템 전용으로 보호됨 |
-| 로지텍 독자 서비스 | `00010000-0000-1000-8000-011f2000046d` | ✅ 일반 커스텀 서비스 |
-
-HID++ 는 **독자 서비스** 로 오간다. 벤더 UUID 는 플랫폼 제약을 받지 않으므로
-`BLUETOOTH_CONNECT` 권한만 있는 평범한 앱이 루팅 없이 쓸 수 있다.
+PC 쪽은 흔히 쓰는 `hidapitester.exe` 를 쓰지 않는다. 망분리 PC 는 GitHub 다운로드가 막혀 있고,
+미서명 바이너리는 AppLocker/백신에 걸린다. 대신 `hid.dll` / `setupapi.dll` 을 P/Invoke 로 직접 호출한다.
+HID 벤더 콜렉션은 일반 사용자 권한으로 열린다.
 
 ---
 
-## 사전 준비: 채널 배치
+## 설정
 
-| | 채널 1 | 채널 2 |
-|---|---|---|
-| 독거미 (AULA F108 5.0) | BT1 = PC | BT2 = 폰 |
-| MX Vertical | **Unifying/Bolt 리시버 = PC** | BT = 폰 |
+### 채널 배치
 
-마우스의 PC 쪽은 반드시 **리시버**여야 한다. 블루투스로 붙어 있으면
-Windows 에서 HID++ 벤더 콜렉션에 접근할 수 없어 PC→폰 방향이 성립하지 않는다.
+| | 채널 1 | 채널 2 | 채널 3 |
+|---|---|---|---|
+| AULA F108 | BT1 = PC | BT2 = 폰 | |
+| MX Vertical | | 폰 (BLE) | PC (Unifying 리시버) |
 
----
+마우스의 PC 쪽은 **반드시 리시버**여야 한다. 블루투스로 붙으면 Windows 에서
+HID++ 벤더 콜렉션에 접근할 수 없다.
 
-## 회사에서 할 일
+`TargetHostIndex` 는 0-based 다. 위 배치면 PC 로 보낼 때 `2`, 폰으로 보낼 때 `1`.
 
-### A. PC (5분)
+### PC
 
 ```powershell
-git pull
+git clone https://github.com/lhs-v/mouse-flow.git
 ```
-
-**A-1. 키보드 InstanceId 찾기** — 키보드를 PC 채널(`Fn+1`)로 둔 상태에서:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -ListBluetooth
 ```
 
-`BTHLE\...` 로 시작하고 Status 가 `OK` 인 항목을 찾아 InstanceId 를 통째로 복사한다.
-
-**A-2. 마우스 슬롯과 feature index 찾기** — 마우스를 리시버 채널로 켜 둔 상태에서:
+키보드의 `BTHLE\...` InstanceId 를 복사한다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -Discover
 ```
 
 `MouseDeviceIndex` 와 `FeatureIndex` 를 알려준다.
-"로지텍 벤더 HID 콜렉션이 없습니다" 가 뜨면 리시버가 안 꽂혀 있거나 마우스가 BT 로 붙어 있는 것이다.
-
-**A-3. `pc/LogiSwitch.ps1` 상단 `$Config` 채우기**
-
-```powershell
-KeyboardInstanceId = 'BTHLE\DEV_...'   # A-1 결과
-MouseDeviceIndex   = 1                 # A-2 결과
-FeatureIndex       = 0x0A              # A-2 결과
-TargetHostIndex    = 1                 # 폰이 채널2 면 1
-```
-
-**A-4. 감지가 되는지 먼저 확인** — 실행해 두고 `Fn+1` / `Fn+2` 를 눌러본다:
+`$Config` 에 값을 채운 뒤 감지가 되는지 먼저 본다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -MonitorKeyboard
 ```
 
-연결됨/끊김이 실시간으로 바뀌면 감지 절반은 끝난 것이다.
-
-**A-4b. 상태가 안 바뀌면** — 이게 흔한 경우다. 블루투스 LE 기기는 링크가 끊겨도
-Windows PnP 노드가 남고 `Status` 도 `OK` 를 유지한다. 추측하지 말고 직접 찾는다:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -FindSignal
-```
-
-연결/해제 두 상태의 전체 PnP 스냅샷을 떠서 **실제로 무엇이 바뀌는지** 비교해 준다.
-`[속성 변화]` 줄이 나오면 거기 적힌 세 줄을 그대로 `$Config` 에 넣는다.
-`[장치 사라짐]` 만 나오면 `DetectMethod = 'ChildHid'` 로 둔다.
-
-**A-5. 전송 단독 시험**
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -SwitchTo 1
-```
-
-마우스가 폰으로 넘어가면 성공.
-
-**A-6. 실사용**
+상태가 안 바뀌면 `-FindSignal` 로 실제 신호를 찾는다. 연결/해제 두 상태의 PnP 스냅샷을
+떠서 무엇이 달라지는지 비교하고, `$Config` 에 넣을 값을 그대로 출력해 준다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -Watch
 ```
 
-시작프로그램에 넣으려면 `Win+R` → `shell:startup` 에 위 명령의 바로가기를 만든다.
+시작프로그램은 `Win+R` → `shell:startup` 에 바로가기를 넣는다.
 
-### B. 폰 (10분)
+### 폰
 
-앱은 집에서 Android Studio 로 빌드해 미리 설치해 둔다 (`android/` 를 열고 Run).
-외부 의존성이 없어서 기본 템플릿 그대로 빌드된다.
+[Releases](https://github.com/lhs-v/mouse-flow/releases) 에서 APK 를 받는다.
+직접 빌드하려면 `android/` 를 Android Studio 로 열면 된다. 외부 의존성이 없다.
 
-1. 마우스를 폰 채널로 전환 (바닥 버튼)
-2. 앱 실행 → 권한 허용 → 키보드/마우스 선택
-3. **[연결 + 서비스 탐색]**
-   - 로그에 `00010000-0000-1000-8000-011f2000046d` 가 보이는지 확인 ← **여기가 갈림길**
-   - 안 보이면 폰 쪽 경로는 불가. PC 방향만 쓰면 된다
-4. 쓰기 특성 / 알림 특성 선택 (`WRITE` 와 `NOTIFY` 속성 참고)
-5. **[Feature Index 조회]** — 응답이 오면 프로토콜이 통한 것
-   - 응답이 없으면 **"리포트 ID 포함" 체크를 반대로** 하고 다시. 이게 가장 흔한 실패 원인이다
-   - 알림 특성을 다른 것으로 바꿔가며 시도
-6. **[지금 전환]** — 마우스가 PC 로 넘어가면 완성
-7. **자동 전환** 켜기
+1. 권한 허용 → 키보드·마우스 선택
+2. **[연결 + 서비스 탐색]** — 벤더 서비스가 보이는지 확인
+3. **[전체 조합 자동 탐색]** — feature index 와 현재 호스트를 읽어온다
+4. **대상 호스트** 에 PC 채널 번호 − 1 을 입력
+5. **[지금 전환]** 로 수동 확인
+6. **자동 전환** 켜기
 
 ---
 
 ## 잘 안 될 때
 
-| 증상 | 확인할 것 |
+| 증상 | 원인 |
 |---|---|
-| `-Discover` 에서 콜렉션 없음 | 리시버가 안 꽂혔거나 마우스가 BT 연결. 리시버 채널로 전환 |
-| `제외 (HID++ 리포트 크기 아님)` 만 나옴 | 잡힌 로지텍 기기가 헤드셋/G-Series 등 다른 프로토콜이다. HID++ 는 출력 리포트가 정확히 20 또는 7바이트 |
-| `-Discover` 에서 슬롯 전부 무응답 | 마우스가 리시버 채널로 켜져 있는지. 전원 스위치 확인 |
-| 슬롯이 여러 개 나옴 | 키보드도 리시버에 물린 것. 마우스 슬롯을 골라 넣을 것 |
-| `-MonitorKeyboard` 가 **연결됨에서 안 변함** | BLE 기기는 끊겨도 `Status` 가 `OK` 로 남는다. `-FindSignal` 로 실제 신호를 찾아 `DetectMethod` 를 지정할 것 |
-| `-MonitorKeyboard` 가 처음부터 끊김 | InstanceId 가 틀렸다. `BTHLE\` 항목인지 확인 |
-| `-FindSignal` 이 변화 0건 | Windows 가 이 키보드의 링크 해제를 노출하지 않는 것. PC→폰 방향은 핫키(`-SwitchTo`)로 수동 실행 |
-| 스크립트 실행 차단 | 실행 정책이 GPO 로 잠긴 것. 정책 확인 필요 |
-| 앱에서 벤더 서비스 안 보임 | 폰 쪽 경로 불가. PC 방향만 사용 |
-| 앱 Feature Index 조회 무응답 | 리포트 ID 체크 반대로 / 알림 특성 변경 |
-| 자동 전환이 멋대로 발동 | "화면 켜져 있을 때만" 켜기, 디바운스 늘리기 |
+| `-Discover` 에서 콜렉션 없음 | 리시버 미연결, 또는 마우스가 BT 로 붙어 있음 |
+| `제외 (HID++ 리포트 크기 아님)` 만 나옴 | 잡힌 로지텍 기기가 헤드셋/G-Series 등 다른 프로토콜 |
+| `-MonitorKeyboard` 가 안 변함 | BLE 는 끊겨도 `Status` 가 `OK`. `-FindSignal` 사용 |
+| 앱에서 벤더 서비스가 안 보임 | 마우스가 폰 채널로 켜져 있는지 확인 |
+| `write 실패 status=13` | 프레임이 18바이트가 아님 |
+| `오류 응답 InvalidFunctionID` | 프레임 구조는 맞고 funcId 가 틀림 |
+| 자동 전환이 조용히 안 됨 | 앱을 열면 서비스 기록이 자동으로 표시된다. 거기 이유가 남는다 |
+| 자동 전환이 멋대로 발동 | 키보드 절전 끊김. 디바운스를 늘리거나 "화면 켜져 있을 때만" 을 켠다 |
 
 ---
 
 ## 알려진 한계
 
-- 마우스가 폰에 있는 동안 PC 는 마우스와 무선 링크가 완전히 없다. 폰 쪽 앱이 안 되면 복귀는 물리 버튼뿐이다.
-- 키보드가 절전이나 거리 이탈로 끊겨도 트리거된다. 디바운스와 화면 상태 조건으로 완화한다.
-- 폰 앱의 GATT 경로는 미검증이다. 실기 확인 전까지는 될지 알 수 없다.
-- 사내 PC 에서 스크립트 실행이 정책상 허용되는지 사전에 확인할 것.
+- 폰 앱이 1.5초마다 폴링한다. 배터리 영향은 크지 않지만 0 은 아니다.
+- 키보드가 절전이나 거리 이탈로 끊겨도 트리거된다. 기본 디바운스 5초로 완화한다.
+- 마우스가 폰에 있는 동안 PC 는 마우스에 접근할 수 없다. 프로토콜상 불가피하다.
+- 사내 PC 에서 스크립트 실행이 정책상 허용되는지 확인할 것.
