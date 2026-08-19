@@ -14,6 +14,9 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.widget.FrameLayout
 import android.text.method.ScrollingMovementMethod
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -59,6 +62,15 @@ class MainActivity : Activity() {
     private lateinit var autoCheck: CheckBox
     private lateinit var screenCheck: CheckBox
 
+    private lateinit var tabContent: FrameLayout
+    private lateinit var tabButtons: List<Button>
+    private lateinit var lblMouseState: TextView
+    private lateinit var lblKbState: TextView
+    private lateinit var lblAutoState: TextView
+    private lateinit var lblRecent: TextView
+    private lateinit var setupHostSpinner: Spinner
+    private val ui = Handler(Looper.getMainLooper())
+
     private var bonded: List<BluetoothDevice> = emptyList()
     private var charUuids: List<String> = emptyList()
 
@@ -69,13 +81,29 @@ class MainActivity : Activity() {
         requestPerms()
         loadBonded()
         restore()
-        log("준비됨. 마우스를 폰 채널로 켜고 [연결 + 서비스 탐색] 을 누르세요.")
-        showServiceLog()
+        if (p.targetHost in 0..2) setupHostSpinner.setSelection(p.targetHost)
+        showTab(if (p.mouseMac.isBlank() || p.featureIndex == 0) 1 else 0)
+        ui.post(statusTicker)
+    }
+
+    /** 상태 탭이 보이는 동안 2초마다 갱신한다. */
+    private val statusTicker = object : Runnable {
+        override fun run() {
+            try {
+                if (tabContent.getChildAt(0).visibility == android.view.View.VISIBLE) refreshStatus()
+            } catch (e: Exception) { }
+            ui.postDelayed(this, 2000)
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        showServiceLog()
+        refreshStatus()
+    }
+
+    override fun onDestroy() {
+        ui.removeCallbacks(statusTicker)
+        super.onDestroy()
     }
 
     /** 자동 전환은 화면을 안 보는 사이에 일어나므로, 열 때마다 기록을 먼저 보여준다. */
@@ -92,7 +120,210 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun buildUi(): ScrollView {
+    private fun buildUi(): android.view.View {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        tabContent = FrameLayout(this)
+        root.addView(tabContent, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val names = listOf("상태", "설정", "고급")
+        val btns = ArrayList<Button>()
+        for (i in names.indices) {
+            val b = Button(this).apply {
+                text = names[i]
+                setOnClickListener { showTab(i) }
+            }
+            bar.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            btns.add(b)
+        }
+        tabButtons = btns
+        root.addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        tabContent.addView(buildStatusView())
+        tabContent.addView(buildSetupView())
+        tabContent.addView(buildAdvancedView())
+        return root
+    }
+
+    private fun showTab(i: Int) {
+        for (n in 0 until tabContent.childCount) {
+            tabContent.getChildAt(n).visibility =
+                if (n == i) android.view.View.VISIBLE else android.view.View.GONE
+        }
+        for (n in tabButtons.indices) {
+            tabButtons[n].setTypeface(null, if (n == i) Typeface.BOLD else Typeface.NORMAL)
+        }
+        if (i == 0) refreshStatus()
+        if (i == 2) showServiceLog()
+    }
+
+    // ------------------------------------------------------------ 상태 탭
+
+    private fun buildStatusView(): android.view.View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(20))
+        }
+
+        root.addView(TextView(this).apply {
+            text = "지금 어디에 연결돼 있나"
+            setTypeface(null, Typeface.BOLD)
+            textSize = 17f
+            setPadding(0, 0, 0, dp(16))
+        })
+
+        fun bigLine(): TextView {
+            val t = TextView(this).apply {
+                textSize = 16f
+                setPadding(0, dp(10), 0, dp(10))
+            }
+            root.addView(t)
+            return t
+        }
+
+        lblMouseState = bigLine()
+        lblKbState = bigLine()
+        lblAutoState = bigLine()
+
+        root.addView(TextView(this).apply {
+            text = "마우스가 폰에 없으면 PC 에서 쓰는 중입니다."
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(0, dp(8), 0, dp(16))
+        })
+
+        autoCheck = CheckBox(this).apply {
+            text = "자동 전환 사용"
+            textSize = 15f
+            setOnCheckedChangeListener { _, checked -> onAutoToggled(checked) }
+        }
+        root.addView(autoCheck)
+
+        root.addView(Button(this).apply {
+            text = "마우스를 PC 로 보내기"
+            setOnClickListener { doSwitch() }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(52)))
+
+        root.addView(Button(this).apply {
+            text = "상태 새로고침"
+            setOnClickListener { refreshStatus() }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        root.addView(TextView(this).apply {
+            text = "최근 활동"
+            setTypeface(null, Typeface.BOLD)
+            setPadding(0, dp(20), 0, dp(6))
+        })
+        lblRecent = TextView(this).apply {
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.DKGRAY)
+        }
+        root.addView(lblRecent)
+
+        return ScrollView(this).apply { addView(root) }
+    }
+
+    private fun refreshStatus() {
+        val mouseOn = BtState.isOnThisPhone(this, p.mouseMac)
+        val kbOn = BtState.isOnThisPhone(this, p.keyboardMac)
+
+        fun render(label: String, onPhone: Boolean?): Pair<String, Int> = when (onPhone) {
+            null -> Pair(label + "   설정 안 됨", Color.GRAY)
+            true -> Pair(label + "   ● 폰에서 사용 중", Color.rgb(30, 120, 50))
+            else -> Pair(label + "   ○ PC 에서 사용 중", Color.rgb(170, 90, 0))
+        }
+
+        val m = render("마우스", mouseOn)
+        lblMouseState.text = m.first; lblMouseState.setTextColor(m.second)
+
+        val k = render("키보드", kbOn)
+        lblKbState.text = k.first; lblKbState.setTextColor(k.second)
+
+        val running = BtState.isServiceRunning(this)
+        lblAutoState.text = if (running) "자동 전환   ● 감시 중" else "자동 전환   ○ 꺼짐"
+        lblAutoState.setTextColor(if (running) Color.rgb(30, 120, 50) else Color.GRAY)
+
+        lblRecent.text = EventLog.read(this).trim().lines().takeLast(6).joinToString("\n")
+    }
+
+    // ------------------------------------------------------------ 설정 탭
+
+    private fun buildSetupView(): android.view.View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+        }
+
+        fun step(n: Int, t: String) = root.addView(TextView(this).apply {
+            text = n.toString() + ". " + t
+            setTypeface(null, Typeface.BOLD)
+            textSize = 15f
+            setPadding(0, dp(18), 0, dp(6))
+        })
+        fun hint(t: String) = root.addView(TextView(this).apply {
+            text = t
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(0, 0, 0, dp(6))
+        })
+
+        step(1, "권한 허용")
+        root.addView(Button(this).apply {
+            text = "권한 요청"
+            setOnClickListener { requestPerms(); loadBonded() }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        step(2, "기기 선택")
+        hint("두 기기 모두 폰에 연결한 상태에서 고르세요.")
+        root.addView(TextView(this).apply { text = "키보드"; textSize = 13f })
+        kbSpinner = Spinner(this); root.addView(kbSpinner)
+        root.addView(TextView(this).apply { text = "마우스"; textSize = 13f })
+        mouseSpinner = Spinner(this); root.addView(mouseSpinner)
+        root.addView(Button(this).apply {
+            text = "기기 목록 새로고침"
+            setOnClickListener { loadBonded() }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        step(3, "PC 는 마우스의 몇 번 채널?")
+        hint("마우스 바닥 버튼으로 PC 에 연결될 때의 채널 번호입니다.")
+        setupHostSpinner = Spinner(this).apply {
+            adapter = simpleAdapter(listOf("1번 채널", "2번 채널", "3번 채널"))
+        }
+        root.addView(setupHostSpinner)
+        setupHostSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(a: android.widget.AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) {
+                p.targetHost = pos
+                hostEdit.setText(pos.toString())
+            }
+            override fun onNothingSelected(a: android.widget.AdapterView<*>?) {}
+        }
+
+        step(4, "마우스와 통신 확인")
+        hint("마우스를 폰 채널에 켜 둔 상태에서 누르세요.")
+        root.addView(Button(this).apply {
+            text = "자동 설정"
+            setOnClickListener { doSweep(); showTab(2) }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+
+        step(5, "배터리 최적화 해제")
+        hint("삼성 기기는 최적화가 켜져 있으면 감시가 끊깁니다.")
+        root.addView(Button(this).apply {
+            text = "앱 설정 열기"
+            setOnClickListener {
+                try {
+                    startActivity(Intent(
+                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.parse("package:" + packageName)))
+                } catch (e: Exception) { log("설정 열기 실패: " + e.message) }
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        return ScrollView(this).apply { addView(root) }
+    }
+
+    private fun buildAdvancedView(): ScrollView {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
@@ -116,17 +347,7 @@ class MainActivity : Activity() {
             setOnClickListener { onClick() }
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
-        head("1. 기기")
-
-        label("키보드 (이 기기가 끊기면 마우스를 밀어냅니다)")
-        kbSpinner = Spinner(this); root.addView(kbSpinner)
-
-        label("마우스 (전환 대상)")
-        mouseSpinner = Spinner(this); root.addView(mouseSpinner)
-
-        button("기기 목록 새로고침") { loadBonded() }
-
-        head("2. GATT 탐색")
+        head("GATT 탐색")
 
         label("서비스 UUID")
         svcEdit = EditText(this).apply { setSingleLine(); textSize = 12f }
@@ -146,7 +367,7 @@ class MainActivity : Activity() {
         }
         root.addView(rptCheck)
 
-        head("3. 전환")
+        head("전환")
 
         label("Feature Index (16진수, 비우면 자동 조회)")
         featEdit = EditText(this).apply { setSingleLine(); textSize = 12f }
@@ -160,14 +381,7 @@ class MainActivity : Activity() {
         button("Feature Index 조회") { doProbeFeature() }
         button("지금 전환") { doSwitch() }
 
-        head("4. 자동 전환")
-
-        autoCheck = CheckBox(this).apply {
-            text = "키보드가 끊기면 자동으로 전환"
-            textSize = 13f
-            setOnCheckedChangeListener { _, checked -> onAutoToggled(checked) }
-        }
-        root.addView(autoCheck)
+        head("자동 전환 세부")
 
         screenCheck = CheckBox(this).apply {
             text = "화면이 켜져 있을 때만 (주머니 속 오발 방지)"
@@ -175,7 +389,7 @@ class MainActivity : Activity() {
         }
         root.addView(screenCheck)
 
-        head("5. 수동 전송 (실험용)")
+        head("수동 전송 (실험용)")
 
         label("RAW 바이트 (예: 11 FF 00 0D 18 14 00)")
         rawEdit = EditText(this).apply { setSingleLine(); textSize = 12f }

@@ -11,6 +11,9 @@ Fn+1  키보드 -> PC    :  폰 앱이 감지, 마우스를 PC 로 밀어냄
 Fn+2  키보드 -> 폰    :  PC 스크립트가 감지, 마우스를 폰으로 밀어냄
 ```
 
+> **처음 쓰시나요?** 클릭만으로 따라 할 수 있는 [사용법.md](%EC%82%AC%EC%9A%A9%EB%B2%95.md) 를 보세요.
+> 아래 내용은 동작 원리와 프로토콜 분석입니다.
+
 키 하나로 키보드와 마우스가 같이 넘어간다. 마우스를 들어 바닥 버튼을 누를 일이 없다.
 
 ---
@@ -90,8 +93,11 @@ RX  0C 1D 00         성공
 ## 구성
 
 ```
-pc/LogiSwitch.ps1     Windows 감시 스크립트 (외부 실행파일·관리자 권한 불필요)
-android/              폰 앱 (설정 + 진단 + 자동 전환)
+LogiSwitch 시작.cmd   더블클릭용 런처
+pc/LogiSwitchApp.ps1  Windows 데스크톱 앱 (GUI, 트레이 상주)
+pc/LogiSwitchCore.ps1 공용 HID++ 엔진
+pc/LogiSwitch.ps1     명령줄 진단 도구 (-Discover, -FindSignal 등)
+android/              폰 앱 (상태 / 설정 / 고급 탭)
 ```
 
 PC 쪽은 흔히 쓰는 `hidapitester.exe` 를 쓰지 않는다. 망분리 PC 는 GitHub 다운로드가 막혀 있고,
