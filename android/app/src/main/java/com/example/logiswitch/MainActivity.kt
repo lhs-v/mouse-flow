@@ -6,6 +6,7 @@ import android.app.Activity
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -303,11 +304,12 @@ class MainActivity : Activity() {
                 val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 if (!ble.bind(svc, w, n)) return@execute
 
+                // HID 서비스(0x1812) 진단은 절대 여기서 하지 않는다.
+                // readCharacteristic 이 SecurityException 을 던지면 프레임워크의
+                // mDeviceBusy 가 true 로 고정돼 이후 모든 GATT 작업이 막힌다.
+                // 차단된다는 사실은 이미 실기로 확인됐다.
                 log("")
-                log("=== HID 서비스 접근 가능 여부 ===")
-                try { ble.probeHidService() } catch (e: Exception) {
-                    log("HID 서비스 접근: 차단됨 (${e.javaClass.simpleName})")
-                }
+                log("(HID 서비스 0x1812 는 BLUETOOTH_PRIVILEGED 필요 - 확인 완료, 건너뜀)")
 
                 val vendorChar = w ?: ble.characteristicsOf(svc).firstOrNull()?.uuid
                 if (vendorChar != null) {
@@ -345,6 +347,16 @@ class MainActivity : Activity() {
 
                                 var resp = try { ble.request(pkt, 1200, wt) } catch (e: Exception) {
                                     log("  예외: ${e.javaClass.simpleName}"); null
+                                }
+
+                                // GATT 큐가 막혔으면 연결을 새로 맺고 이 조합만 한 번 더
+                                if (resp == null && ble.lastWriteRc == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY) {
+                                    log("  큐가 막혀 재연결합니다")
+                                    ble.close()
+                                    Thread.sleep(400)
+                                    if (ble.connect(adapter.getRemoteDevice(p.mouseMac)) && ble.bind(svc, w, n)) {
+                                        resp = try { ble.request(pkt, 1200, wt) } catch (e: Exception) { null }
+                                    }
                                 }
 
                                 // 알림이 안 오면 특성을 읽어서 응답이 거기 있는지 본다

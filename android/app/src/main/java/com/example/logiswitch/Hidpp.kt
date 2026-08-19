@@ -110,6 +110,10 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
     private var gatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
 
+    /** 마지막 writeCharacteristic 반환 코드. 201 = ERROR_GATT_WRITE_REQUEST_BUSY */
+    var lastWriteRc: Int = -1
+        private set
+
     private val connQ = LinkedBlockingQueue<Boolean>()
     private val discQ = LinkedBlockingQueue<Boolean>()
     private val writeAckQ = LinkedBlockingQueue<Int>()
@@ -285,7 +289,12 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         val started = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val rc = g.writeCharacteristic(c, payload, type)
-                if (rc != BluetoothStatusCodes.SUCCESS) log("  writeCharacteristic 거부 rc=$rc")
+                lastWriteRc = rc
+                if (rc != BluetoothStatusCodes.SUCCESS) {
+                    val why = if (rc == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY)
+                        "rc=$rc GATT 큐가 막힘 (이전 작업 미완료)" else "rc=$rc"
+                    log("  writeCharacteristic 거부 $why")
+                }
                 rc == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
