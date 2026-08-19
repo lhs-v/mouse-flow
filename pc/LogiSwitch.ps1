@@ -24,6 +24,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Watch')]
 param(
     [Parameter(ParameterSetName = 'ListBluetooth')][switch] $ListBluetooth,
+    [Parameter(ParameterSetName = 'FindSignal')]   [switch] $FindSignal,
     [Parameter(ParameterSetName = 'Discover')]     [switch] $Discover,
     [Parameter(ParameterSetName = 'Monitor')]      [switch] $MonitorKeyboard,
     [Parameter(ParameterSetName = 'SwitchTo')]     [int]    $SwitchTo = -1,
@@ -43,6 +44,16 @@ $Config = @{
     # [1-b] InstanceId 를 못 찾겠으면 이름 일부로 대체 가능 (위를 비워두고 여기에)
     #       예: 'AULA' 또는 'Keyboard K'
     KeyboardNamePattern = ''
+
+    # [1-c] 연결 해제를 무엇으로 판단할지.
+    #   'Auto'     : BtConnected -> ChildHid -> Status 순으로 가능한 것을 자동 선택 (권장)
+    #   'Status'   : PnP Status 가 OK 인지  ※ BLE 기기는 끊겨도 OK 라 대개 안 먹힌다
+    #   'BtConnected' : 블루투스 연결 상태 속성
+    #   'ChildHid' : 이 기기의 하위 HID 노드가 존재하는지
+    #   'Property' : 아래 두 값으로 직접 지정 (-FindSignal 결과를 넣는다)
+    DetectMethod = 'Auto'
+    DetectPropertyKey = ''
+    DetectPropertyConnectedValue = ''
 
     # [2] 마우스가 리시버에 물린 슬롯 번호 (1~6). -Discover 가 알려줍니다.
     MouseDeviceIndex = 1
@@ -345,18 +356,81 @@ function Send-ChangeHost {
     Write-Host ("  -> ChangeHost(host={0}) 전송  [devIdx={1} featIdx=0x{2:X2}]" -f $HostIndex, $devIdx, $feat) -ForegroundColor Green
 }
 
-function Test-KeyboardConnected {
+# 블루투스 연결 상태 속성. BLE 기기는 끊겨도 PnP 노드와 Status 가 그대로 남기 때문에
+# Status 로는 판별할 수 없다. 이 속성은 실제 링크 상태를 돌려준다.
+$script:PK_BT_CONNECTED = '{83DA6326-97A6-4088-9453-A1923F573B29} 15'
+
+function Get-KeyboardDevice {
     if ($Config.KeyboardInstanceId) {
-        $d = Get-PnpDevice -InstanceId $Config.KeyboardInstanceId -ErrorAction SilentlyContinue
-    } elseif ($Config.KeyboardNamePattern) {
-        $d = Get-PnpDevice -ErrorAction SilentlyContinue |
-             Where-Object { $_.InstanceId -like 'BTH*' -and $_.FriendlyName -like "*$($Config.KeyboardNamePattern)*" } |
-             Select-Object -First 1
-    } else {
-        throw '설정에서 KeyboardInstanceId 또는 KeyboardNamePattern 을 채워주세요. (-ListBluetooth 참고)'
+        return Get-PnpDevice -InstanceId $Config.KeyboardInstanceId -ErrorAction SilentlyContinue
     }
+    if ($Config.KeyboardNamePattern) {
+        return Get-PnpDevice -ErrorAction SilentlyContinue |
+               Where-Object { $_.InstanceId -like 'BTH*' -and $_.FriendlyName -like "*$($Config.KeyboardNamePattern)*" } |
+               Select-Object -First 1
+    }
+    throw '설정에서 KeyboardInstanceId 또는 KeyboardNamePattern 을 채워주세요. (-ListBluetooth 참고)'
+}
+
+function Get-DeviceProp {
+    param([string]$InstanceId, [string]$KeyName)
+    try {
+        $v = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName $KeyName -ErrorAction Stop
+        if ($null -ne $v) { return $v.Data }
+    } catch { }
+    return $null
+}
+
+# 하위 HID 노드 개수. BLE 키보드가 끊기면 보통 HID 자식 노드가 사라진다.
+function Get-ChildHidCount {
+    param([string]$InstanceId)
+    $children = Get-DeviceProp -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_Children'
+    if ($null -eq $children) { return -1 }
+    return @($children).Count
+}
+
+# 사용 가능한 판별 방식을 한 번만 정해서 캐시한다.
+function Resolve-DetectMethod {
+    if ($script:DetectResolved) { return $script:DetectResolved }
+
+    $m = $Config.DetectMethod
+    if ($m -ne 'Auto') { $script:DetectResolved = $m; return $m }
+
+    $d = Get-KeyboardDevice
+    if ($null -eq $d) { $script:DetectResolved = 'Status'; return 'Status' }
+
+    if ($null -ne (Get-DeviceProp -InstanceId $d.InstanceId -KeyName $script:PK_BT_CONNECTED)) {
+        $script:DetectResolved = 'BtConnected'
+    } elseif ((Get-ChildHidCount -InstanceId $d.InstanceId) -ge 0) {
+        $script:DetectResolved = 'ChildHid'
+    } else {
+        $script:DetectResolved = 'Status'
+    }
+    return $script:DetectResolved
+}
+
+function Test-KeyboardConnected {
+    $d = Get-KeyboardDevice
     if ($null -eq $d) { return $false }
-    return ($d.Status -eq 'OK')
+
+    switch (Resolve-DetectMethod) {
+        'BtConnected' {
+            $v = Get-DeviceProp -InstanceId $d.InstanceId -KeyName $script:PK_BT_CONNECTED
+            if ($null -eq $v) { return ($d.Status -eq 'OK') }
+            return [bool]$v
+        }
+        'ChildHid' {
+            return ((Get-ChildHidCount -InstanceId $d.InstanceId) -gt 0)
+        }
+        'Property' {
+            if (-not $Config.DetectPropertyKey) { throw 'DetectMethod=Property 인데 DetectPropertyKey 가 비어 있습니다.' }
+            $v = Get-DeviceProp -InstanceId $d.InstanceId -KeyName $Config.DetectPropertyKey
+            return ((($v -join ',')) -eq $Config.DetectPropertyConnectedValue)
+        }
+        default {
+            return ($d.Status -eq 'OK')
+        }
+    }
 }
 
 # --------------------------------------------------------------------- modes
@@ -370,6 +444,97 @@ if ($ListBluetooth) {
         Format-List
     Write-Host '  힌트: 키보드를 PC 채널(Fn+1)로 둔 상태에서 Status 가 OK 인 항목이 대상입니다.' -ForegroundColor Yellow
     Write-Host '        BTHLE\ 로 시작하는 항목을 우선 사용하세요.' -ForegroundColor Yellow
+    return
+}
+
+if ($FindSignal) {
+    # 연결 해제를 무엇으로 감지할지 추측하지 않고, 실제로 무엇이 바뀌는지 직접 찾아낸다.
+    function Get-PnpSnapshot {
+        $h = @{}
+        Get-PnpDevice -ErrorAction SilentlyContinue | ForEach-Object {
+            $h[$_.InstanceId] = "Status=$($_.Status) Present=$($_.Present)"
+        }
+        return $h
+    }
+    function Get-PropSnapshot {
+        param([string]$InstanceId)
+        $h = @{}
+        if (-not $InstanceId) { return $h }
+        try {
+            Get-PnpDeviceProperty -InstanceId $InstanceId -ErrorAction SilentlyContinue | ForEach-Object {
+                $h[$_.KeyName] = ($_.Data -join ',')
+            }
+        } catch { }
+        return $h
+    }
+
+    $kb = $null
+    try { $kb = Get-KeyboardDevice } catch { }
+    $kbId = if ($kb) { $kb.InstanceId } else { '' }
+
+    Write-Head '연결 해제 신호 찾기'
+    if ($kbId) {
+        Write-Host "  대상 키보드: $($kb.FriendlyName)" -ForegroundColor Cyan
+        Write-Host "              $kbId" -ForegroundColor DarkGray
+    } else {
+        Write-Host '  키보드가 설정되지 않았습니다. 전체 장치 변화만 비교합니다.' -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    Write-Host '  [1단계] 키보드를 PC 채널(Fn+1)로 두고 연결된 상태로 만드세요.' -ForegroundColor Yellow
+    Read-Host  '         준비되면 Enter'
+    $snapA = Get-PnpSnapshot
+    $propA = Get-PropSnapshot -InstanceId $kbId
+    Write-Host "  기준 스냅샷 저장 (장치 $($snapA.Count)개, 속성 $($propA.Count)개)" -ForegroundColor Green
+
+    Write-Host ''
+    Write-Host '  [2단계] 이제 Fn+2 로 폰으로 넘기세요. 폰에 연결된 것을 확인하고 오세요.' -ForegroundColor Yellow
+    Read-Host  '         넘어갔으면 Enter'
+    Start-Sleep -Milliseconds 800
+    $snapB = Get-PnpSnapshot
+    $propB = Get-PropSnapshot -InstanceId $kbId
+
+    Write-Head '결과: 바뀐 것들'
+    $hits = 0
+
+    foreach ($id in $snapA.Keys) {
+        if (-not $snapB.ContainsKey($id)) {
+            Write-Host "  [장치 사라짐] $id" -ForegroundColor Green
+            Write-Host "      연결 시: $($snapA[$id])" -ForegroundColor DarkGray
+            $hits++
+        } elseif ($snapA[$id] -ne $snapB[$id]) {
+            Write-Host "  [상태 변화] $id" -ForegroundColor Green
+            Write-Host "      연결: $($snapA[$id])   ->   해제: $($snapB[$id])" -ForegroundColor DarkGray
+            $hits++
+        }
+    }
+    foreach ($id in $snapB.Keys) {
+        if (-not $snapA.ContainsKey($id)) {
+            Write-Host "  [장치 생김] $id" -ForegroundColor DarkYellow
+            $hits++
+        }
+    }
+
+    foreach ($k in $propA.Keys) {
+        $a = $propA[$k]
+        $b = if ($propB.ContainsKey($k)) { $propB[$k] } else { '(없음)' }
+        if ($a -ne $b) {
+            Write-Host "  [속성 변화] $k" -ForegroundColor Green
+            Write-Host "      연결: '$a'   ->   해제: '$b'" -ForegroundColor DarkGray
+            Write-Host "      => DetectMethod='Property'; DetectPropertyKey='$k'; DetectPropertyConnectedValue='$a'" -ForegroundColor Yellow
+            $hits++
+        }
+    }
+
+    Write-Host ''
+    if ($hits -eq 0) {
+        Write-Host '  아무 변화도 감지되지 않았습니다.' -ForegroundColor Red
+        Write-Host '  키보드가 실제로 폰으로 넘어간 게 맞는지, 2단계에서 충분히 기다렸는지 확인하세요.' -ForegroundColor Yellow
+        Write-Host '  그래도 변화가 없다면 Windows 가 이 키보드의 링크 해제를 노출하지 않는 것입니다.' -ForegroundColor Yellow
+    } else {
+        Write-Host "  변화 $hits 건 발견. 위 [속성 변화] 줄의 설정을 \$Config 에 넣으면 됩니다." -ForegroundColor Cyan
+        Write-Host '  [장치 사라짐] 만 있고 속성 변화가 없다면 DetectMethod = ''ChildHid'' 를 쓰세요.' -ForegroundColor Cyan
+    }
     return
 }
 
@@ -445,13 +610,36 @@ if ($Discover) {
 
 if ($MonitorKeyboard) {
     Write-Head '키보드 연결 상태 모니터 — Fn+1 / Fn+2 를 눌러보세요 (Ctrl+C 종료)'
+
+    $kb = $null
+    try { $kb = Get-KeyboardDevice } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
+    if ($null -eq $kb) { Write-Host '  키보드 장치를 찾지 못했습니다. InstanceId 를 확인하세요.' -ForegroundColor Red; return }
+
+    $method = Resolve-DetectMethod
+    Write-Host "  대상: $($kb.FriendlyName)" -ForegroundColor Cyan
+    Write-Host "  판별 방식: $method" -ForegroundColor Cyan
+    if ($method -eq 'Status') {
+        Write-Host '  주의: Status 방식은 BLE 기기에서 대개 변하지 않습니다.' -ForegroundColor Yellow
+        Write-Host '        상태가 안 바뀌면 -FindSignal 로 실제 신호를 찾으세요.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+
+    # 원시값을 같이 보여줘야 "왜 안 바뀌는지" 를 눈으로 확인할 수 있다.
     $last = $null
     while ($true) {
         try { $now = Test-KeyboardConnected } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
+
+        $raw = switch ($method) {
+            'BtConnected' { "btConnected=$(Get-DeviceProp -InstanceId $kb.InstanceId -KeyName $script:PK_BT_CONNECTED)" }
+            'ChildHid'    { "childHid=$(Get-ChildHidCount -InstanceId $kb.InstanceId)" }
+            'Property'    { "prop=$((Get-DeviceProp -InstanceId $kb.InstanceId -KeyName $Config.DetectPropertyKey) -join ',')" }
+            default       { "status=$((Get-KeyboardDevice).Status)" }
+        }
+
         if ($now -ne $last) {
             $stamp = (Get-Date).ToString('HH:mm:ss.fff')
-            if ($now) { Write-Host "  [$stamp]  연결됨   (PC 채널)"   -ForegroundColor Green }
-            else      { Write-Host "  [$stamp]  끊김     (폰으로 넘어감)" -ForegroundColor Magenta }
+            if ($now) { Write-Host "  [$stamp]  연결됨   (PC 채널)        $raw"   -ForegroundColor Green }
+            else      { Write-Host "  [$stamp]  끊김     (폰으로 넘어감)  $raw" -ForegroundColor Magenta }
             $last = $now
         }
         Start-Sleep -Milliseconds $Config.PollIntervalMs

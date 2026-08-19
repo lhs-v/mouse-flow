@@ -130,6 +130,17 @@ powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -MonitorKeyboard
 
 연결됨/끊김이 실시간으로 바뀌면 감지 절반은 끝난 것이다.
 
+**A-4b. 상태가 안 바뀌면** — 이게 흔한 경우다. 블루투스 LE 기기는 링크가 끊겨도
+Windows PnP 노드가 남고 `Status` 도 `OK` 를 유지한다. 추측하지 말고 직접 찾는다:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -FindSignal
+```
+
+연결/해제 두 상태의 전체 PnP 스냅샷을 떠서 **실제로 무엇이 바뀌는지** 비교해 준다.
+`[속성 변화]` 줄이 나오면 거기 적힌 세 줄을 그대로 `$Config` 에 넣는다.
+`[장치 사라짐]` 만 나오면 `DetectMethod = 'ChildHid'` 로 둔다.
+
 **A-5. 전송 단독 시험**
 
 ```powershell
@@ -173,7 +184,9 @@ powershell -ExecutionPolicy Bypass -File .\pc\LogiSwitch.ps1 -Watch
 | `제외 (HID++ 리포트 크기 아님)` 만 나옴 | 잡힌 로지텍 기기가 헤드셋/G-Series 등 다른 프로토콜이다. HID++ 는 출력 리포트가 정확히 20 또는 7바이트 |
 | `-Discover` 에서 슬롯 전부 무응답 | 마우스가 리시버 채널로 켜져 있는지. 전원 스위치 확인 |
 | 슬롯이 여러 개 나옴 | 키보드도 리시버에 물린 것. 마우스 슬롯을 골라 넣을 것 |
-| `-MonitorKeyboard` 가 안 변함 | InstanceId 가 틀렸다. `BTHLE\` 항목인지 확인 |
+| `-MonitorKeyboard` 가 **연결됨에서 안 변함** | BLE 기기는 끊겨도 `Status` 가 `OK` 로 남는다. `-FindSignal` 로 실제 신호를 찾아 `DetectMethod` 를 지정할 것 |
+| `-MonitorKeyboard` 가 처음부터 끊김 | InstanceId 가 틀렸다. `BTHLE\` 항목인지 확인 |
+| `-FindSignal` 이 변화 0건 | Windows 가 이 키보드의 링크 해제를 노출하지 않는 것. PC→폰 방향은 핫키(`-SwitchTo`)로 수동 실행 |
 | 스크립트 실행 차단 | 실행 정책이 GPO 로 잠긴 것. 정책 확인 필요 |
 | 앱에서 벤더 서비스 안 보임 | 폰 쪽 경로 불가. PC 방향만 사용 |
 | 앱 Feature Index 조회 무응답 | 리포트 ID 체크 반대로 / 알림 특성 변경 |
