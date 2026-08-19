@@ -1,5 +1,6 @@
 package com.example.logiswitch
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -30,18 +31,31 @@ class AutoSwitchService : Service() {
     private var lastFireAt = 0L
     private var busy = false
 
+    @SuppressLint("MissingPermission")
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
-            if (intent.action != BluetoothDevice.ACTION_ACL_DISCONNECTED) return
+            val act = intent.action ?: return
 
             val dev = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                 intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
             else
                 @Suppress("DEPRECATION") intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
 
-            val mac = dev?.address ?: return
-            if (!mac.equals(p.keyboardMac, ignoreCase = true)) return
+            val mac = dev?.address ?: "(주소없음)"
+            val name = try { dev?.name ?: "?" } catch (e: Exception) { "?" }
+            val kind = when (act) {
+                BluetoothDevice.ACTION_ACL_CONNECTED -> "연결"
+                BluetoothDevice.ACTION_ACL_DISCONNECTED -> "해제"
+                else -> act
+            }
 
+            // 어떤 기기의 어떤 이벤트든 남긴다. MAC 이 틀렸으면 여기서 바로 보인다.
+            val match = mac.equals(p.keyboardMac, ignoreCase = true)
+            EventLog.add(this@AutoSwitchService,
+                "BT " + kind + "  " + name + "  " + mac + (if (match) "   <<< 감시 대상" else ""))
+
+            if (act != BluetoothDevice.ACTION_ACL_DISCONNECTED) return
+            if (!match) return
             onKeyboardGone()
         }
     }
@@ -64,17 +78,22 @@ class AutoSwitchService : Service() {
 
         // API 34+ 는 리시버 등록 시 export 여부를 반드시 지정해야 한다.
         // 시스템 브로드캐스트만 받으므로 NOT_EXPORTED 가 맞다.
-        val filter = IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             registerReceiver(receiver, filter)
         }
+        EventLog.add(this, "== 감시 서비스 시작 == 대상 키보드 ${p.keyboardMac}, host=${p.targetHost}")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        EventLog.add(this, "== 감시 서비스 종료 ==")
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
         io.shutdownNow()
         super.onDestroy()
@@ -86,12 +105,17 @@ class AutoSwitchService : Service() {
 
     private fun onKeyboardGone() {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastFireAt < p.debounceMs) return
-        if (busy) return
+
+        if (now - lastFireAt < p.debounceMs) {
+            EventLog.add(this, "  무시: 디바운스")
+            return
+        }
+        if (busy) { EventLog.add(this, "  무시: 이전 전환이 진행 중"); return }
 
         if (p.onlyWhenScreenOn) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isInteractive) {
+            val pmChk = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pmChk.isInteractive) {
+                EventLog.add(this, "  무시: 화면 꺼짐 ('화면 켜져 있을 때만' 옵션)")
                 notify("화면 꺼짐 상태라 무시함")
                 return
             }
@@ -99,18 +123,29 @@ class AutoSwitchService : Service() {
 
         lastFireAt = now
         busy = true
+        EventLog.add(this, "  전환 시작 -> host=" + p.targetHost)
         notify("키보드 끊김 감지 — 마우스 전환 중")
 
         io.execute {
-            val sb = StringBuilder()
-            val ok = try {
-                SwitchOp.run(this@AutoSwitchService, p) { line -> sb.append(line).append('\n') }
-            } catch (e: Exception) {
-                sb.append("예외: ").append(e.message)
-                false
+            // 화면이 꺼진 상태에서 GATT 작업이 잘리지 않도록 잠깐 깨워 둔다
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LogiSwitch:switch")
+            try {
+                wl.acquire(30_000L)
+                val ok = try {
+                    SwitchOp.run(this@AutoSwitchService, p) { line ->
+                        EventLog.add(this@AutoSwitchService, "    " + line)
+                    }
+                } catch (e: Exception) {
+                    EventLog.add(this@AutoSwitchService, "    예외: " + e.message)
+                    false
+                }
+                EventLog.add(this@AutoSwitchService, "  결과: " + (if (ok) "성공" else "실패"))
+                notify(if (ok) "전환 명령 전송됨" else "전환 실패 — 앱에서 로그 확인")
+            } finally {
+                busy = false
+                try { if (wl.isHeld) wl.release() } catch (e: Exception) { }
             }
-            busy = false
-            notify(if (ok) "전환 명령 전송됨" else "전환 실패 — 앱에서 로그 확인")
         }
     }
 

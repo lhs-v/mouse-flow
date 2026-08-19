@@ -167,6 +167,12 @@ class MainActivity : Activity() {
         button("RAW 전송") { doRaw() }
 
         head("로그")
+        button("서비스 기록 보기  (자동 전환이 왜 안 됐는지)") {
+            logView.text = ""
+            log("=== 백그라운드 서비스 기록 ===")
+            log(EventLog.read(this))
+        }
+        button("서비스 기록 지우기") { EventLog.clear(this); log("서비스 기록 삭제됨") }
         button("로그 지우기") { logView.text = "" }
 
         logView = TextView(this).apply {

@@ -52,9 +52,13 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("auto", false)
         set(v) = sp.edit().putBoolean("auto", v).apply()
 
-    /** 화면이 꺼져 있으면 무시. 주머니 속 절전 끊김으로 오발하는 걸 막는다. */
+    /**
+     * 화면이 꺼져 있으면 무시.
+     * PC 로 돌아갈 때는 폰 화면이 꺼져 있는 게 정상이므로 기본값은 false 다.
+     * 주머니 속 오발이 잦으면 켠다.
+     */
     var onlyWhenScreenOn: Boolean
-        get() = sp.getBoolean("screenOn", true)
+        get() = sp.getBoolean("screenOn", false)
         set(v) = sp.edit().putBoolean("screenOn", v).apply()
 
     /** 이 시간 안에 다시 트리거되면 무시 (ms). */
