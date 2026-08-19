@@ -81,6 +81,7 @@ $sync = [hashtable]::Synchronized(@{
     Log          = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
     Requests     = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
     BtList       = $null            # 워커가 채워 넣는 장치 목록
+    NeedSave     = $false           # 워커가 설정을 바꿨으니 UI 가 저장하라는 신호
     Busy         = ''
 })
 
@@ -131,7 +132,7 @@ $worker = {
                     $Config.FeatureIndex     = $fi
                     $Config.ForceHidPath     = $c.Path
                     W ("마우스를 찾았습니다. 슬롯 $idx, feature 0x{0:X2}" -f $fi)
-                    $sync.Requests.Enqueue('save')
+                    $sync.NeedSave = $true
                     return
                 }
             }
@@ -368,6 +369,9 @@ $timer.add_Tick({
     }
     Sync-BtCombo
 
+    # 워커가 자동 탐색으로 설정을 바꿨으면 여기서 파일에 쓴다.
+    if ($sync.NeedSave) { $sync.NeedSave = $false; Export-AppConfig; Add-UiLog '설정을 저장했습니다.' }
+
     switch ($sync.KbConnected) {
         $true  { $lblKb.Text = '키보드:  ● PC 에 연결됨';            $lblKb.ForeColor = [System.Drawing.Color]::FromArgb(30,120,50) }
         $false { $lblKb.Text = '키보드:  ○ PC 에 없음 (폰 사용 중)'; $lblKb.ForeColor = [System.Drawing.Color]::FromArgb(170,90,0) }
@@ -382,6 +386,10 @@ $timer.add_Tick({
         $lblMouse.Text = '마우스:  ○ PC 에 없음 (폰 사용 중)'
         $lblMouse.ForeColor = [System.Drawing.Color]::FromArgb(170,90,0)
         if ($tray.Icon -ne $IconOff) { $tray.Icon = $IconOff; $tray.Text = 'LogiSwitch — 마우스 폰' }
+    }
+
+    if ($Config.FeatureIndex -ne 0 -and -not $lblMouseCfg.Text) {
+        $lblMouseCfg.Text = ("슬롯 $($Config.MouseDeviceIndex) / 0x{0:X2}" -f $Config.FeatureIndex)
     }
 
     if ($sync.Watching) {

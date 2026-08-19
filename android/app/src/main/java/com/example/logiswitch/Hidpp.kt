@@ -18,48 +18,20 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
- * HID++ 2.0 패킷 조립/해석.
+ * HID++ 2.0 패킷 조립/해석 (BLE 벤더 GATT 전용).
  *
- * long report (20바이트):
- *   [0] 0x11  리포트 ID
- *   [1] devIdx        BLE 직결이면 0xFF
- *   [2] featureIndex  런타임에 조회해야 함 (펌웨어마다 다름)
- *   [3] (funcId shl 4) or swId
- *   [4..] 파라미터
- *
- * BLE 벤더 GATT 특성에 쓸 때 리포트 ID 바이트가 필요한지는 확인되지 않았다.
- * 그래서 includeReportId 로 두 방식 다 시도할 수 있게 해 둔다.
+ * 프레이밍은 실기로 확정했다. 아래 bleFrame 주석 참고.
+ * USB 리시버용 20바이트 long report 는 PC 쪽 PowerShell 이 담당하므로
+ * 여기에는 두지 않는다.
  */
 object Hidpp {
     const val SW_ID = 0x0D
-    const val DEV_INDEX_BLE = 0xFF
     const val FEATURE_CHANGE_HOST = 0x1814
 
     /** 로지텍 독자 GATT 서비스. HID 서비스(0x1812)와 별개라 일반 앱이 접근 가능하다. */
     const val VENDOR_SERVICE = "00010000-0000-1000-8000-011f2000046d"
 
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-
-    /**
-     * HID++ 패킷 조립.
-     * long  = 20바이트, 리포트 ID 0x11
-     * short =  7바이트, 리포트 ID 0x10
-     * includeReportId=false 면 맨 앞 바이트를 뗀다 (19 / 6바이트).
-     */
-    fun packet(devIdx: Int, featIdx: Int, funcId: Int, params: IntArray,
-               longReport: Boolean, includeReportId: Boolean): ByteArray {
-        val size = if (longReport) 20 else 7
-        val full = ByteArray(size)
-        full[0] = if (longReport) 0x11 else 0x10
-        full[1] = (devIdx and 0xFF).toByte()
-        full[2] = (featIdx and 0xFF).toByte()
-        full[3] = (((funcId and 0x0F) shl 4) or (SW_ID and 0x0F)).toByte()
-        for (i in params.indices) if (4 + i < size) full[4 + i] = (params[i] and 0xFF).toByte()
-        return if (includeReportId) full else full.copyOfRange(1, size)
-    }
-
-    fun report(devIdx: Int, featIdx: Int, funcId: Int, params: IntArray, includeReportId: Boolean): ByteArray =
-        packet(devIdx, featIdx, funcId, params, true, includeReportId)
 
     // ---------------------------------------------------------------- BLE 프레이밍
     //
@@ -108,31 +80,6 @@ object Hidpp {
         else -> "code=$code"
     }
 
-    /** Root(0x0000).getFeature(featureId) */
-    fun rootGetFeature(featureId: Int, includeReportId: Boolean): ByteArray =
-        report(DEV_INDEX_BLE, 0x00, 0x00,
-            intArrayOf((featureId shr 8) and 0xFF, featureId and 0xFF), includeReportId)
-
-    /** 0x1814.setCurrentHost(hostIndex) — 0-based. 0 = 채널1, 1 = 채널2, 2 = 채널3 */
-    fun setCurrentHost(featIdx: Int, hostIndex: Int, includeReportId: Boolean): ByteArray =
-        report(DEV_INDEX_BLE, featIdx, 0x01, intArrayOf(hostIndex), includeReportId)
-
-    /** 0x1814.getHostInfo() */
-    fun getHostInfo(featIdx: Int, includeReportId: Boolean): ByteArray =
-        report(DEV_INDEX_BLE, featIdx, 0x00, intArrayOf(), includeReportId)
-
-    /** 응답에서 리포트 ID를 떼어 [devIdx, featIdx, fn|sw, p0, p1, ...] 형태로 정규화. */
-    fun normalize(raw: ByteArray): ByteArray {
-        if (raw.size < 4) return raw
-        val b0 = raw[0].toInt() and 0xFF
-        return if (b0 == 0x11 || b0 == 0x10) raw.copyOfRange(1, raw.size) else raw
-    }
-
-    /** 오류 응답이면 true. 형식: devIdx, 0xFF, origFeat, origFn|sw, errCode */
-    fun isError(n: ByteArray): Boolean = n.size >= 5 && (n[1].toInt() and 0xFF) == 0xFF
-
-    fun errorCode(n: ByteArray): Int = if (n.size >= 5) n[4].toInt() and 0xFF else -1
-
     fun hex(b: ByteArray): String = b.joinToString(" ") { String.format("%02X", it) }
 
     fun parseHex(s: String): ByteArray? {
@@ -171,7 +118,6 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
     private val descAckQ = LinkedBlockingQueue<Boolean>()
     private val notifyQ = LinkedBlockingQueue<ByteArray>()
     private val readQ = LinkedBlockingQueue<Pair<Int, ByteArray>>()
-    private val mtuQ = LinkedBlockingQueue<Int>()
 
     private val cb = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -182,10 +128,6 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
                     notifyQ.offer(ByteArray(0))   // 대기 중인 request 를 깨운다
                 }
             }
-        }
-
-        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            mtuQ.offer(if (status == BluetoothGatt.GATT_SUCCESS) mtu else -1)
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
@@ -236,16 +178,6 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         val ok = discQ.poll(timeoutMs, TimeUnit.MILLISECONDS)
         if (ok != true) { log("서비스 탐색 실패"); close(); return false }
         return true
-    }
-
-    /** ATT MTU 를 키운다. 기본 23 이면 쓰기 페이로드가 20바이트로 제한된다. */
-    fun negotiateMtu(target: Int = 247): Int {
-        val g = gatt ?: return -1
-        mtuQ.clear()
-        if (!g.requestMtu(target)) { log("requestMtu 호출 실패"); return -1 }
-        val m = mtuQ.poll(4000, TimeUnit.MILLISECONDS) ?: -1
-        log("ATT MTU = $m (쓰기 가능 최대 ${if (m > 3) m - 3 else 0} 바이트)")
-        return m
     }
 
     fun services(): List<BluetoothGattService> = gatt?.services ?: emptyList()
@@ -404,37 +336,6 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         if (r == null) { log("  read 응답 없음"); return null }
         if (r.first != BluetoothGatt.GATT_SUCCESS) { log("  read 실패 status=${r.first}"); return null }
         return r.second
-    }
-
-    /**
-     * 안드로이드가 HID 서비스(0x1812) 접근을 막는지 실제로 확인한다.
-     * HOGP 에서 HID++ 가 원래 오가는 통로이므로, 열려 있다면 그쪽이 정답이다.
-     */
-    fun probeHidService() {
-        val g = gatt ?: return
-        val hid = g.getService(UUID.fromString("00001812-0000-1000-8000-00805f9b34fb"))
-        if (hid == null) { log("HID 서비스 없음"); return }
-        val target = hid.characteristics.firstOrNull {
-            it.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
-        }
-        if (target == null) { log("HID 서비스에 읽을 특성 없음"); return }
-        readQ.clear()
-        val started = try {
-            g.readCharacteristic(target)
-        } catch (e: SecurityException) {
-            log("HID 서비스 접근: 차단됨 (BLUETOOTH_PRIVILEGED 필요) — 예상된 결과")
-            return
-        } catch (e: Exception) {
-            log("HID 서비스 접근: 예외 ${e.javaClass.simpleName}")
-            return
-        }
-        if (!started) { log("HID 서비스 접근: 차단됨 (read 호출 거부)"); return }
-        val r = readQ.poll(2500, TimeUnit.MILLISECONDS)
-        when {
-            r == null -> log("HID 서비스 접근: 응답 없음")
-            r.first != BluetoothGatt.GATT_SUCCESS -> log("HID 서비스 접근: 거부 status=${r.first}")
-            else -> log("HID 서비스 접근: 허용됨! (${Hidpp.hex(r.second)})")
-        }
     }
 
     fun close() {

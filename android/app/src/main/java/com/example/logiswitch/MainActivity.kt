@@ -58,7 +58,6 @@ class MainActivity : Activity() {
     private lateinit var featEdit: EditText
     private lateinit var hostEdit: EditText
     private lateinit var rawEdit: EditText
-    private lateinit var rptCheck: CheckBox
     private lateinit var autoCheck: CheckBox
     private lateinit var screenCheck: CheckBox
 
@@ -361,12 +360,6 @@ class MainActivity : Activity() {
         label("알림 특성 (응답 수신용, 없으면 비워도 됨)")
         notifySpinner = Spinner(this); root.addView(notifySpinner)
 
-        rptCheck = CheckBox(this).apply {
-            text = "페이로드에 리포트 ID(0x11) 포함  ← 안 되면 꺼보세요"
-            textSize = 13f
-        }
-        root.addView(rptCheck)
-
         head("전환")
 
         label("Feature Index (16진수, 비우면 자동 조회)")
@@ -377,8 +370,7 @@ class MainActivity : Activity() {
         hostEdit = EditText(this).apply { setSingleLine(); textSize = 12f }
         root.addView(hostEdit)
 
-        button("전체 조합 자동 탐색  ★ 먼저 이걸 누르세요") { doSweep() }
-        button("Feature Index 조회") { doProbeFeature() }
+        button("마우스와 통신 확인 (feature index 조회)") { doSweep() }
         button("지금 전환") { doSwitch() }
 
         head("자동 전환 세부")
@@ -423,7 +415,6 @@ class MainActivity : Activity() {
         svcEdit.setText(p.serviceUuid)
         featEdit.setText(if (p.featureIndex > 0) "%02X".format(p.featureIndex) else "")
         hostEdit.setText(p.targetHost.toString())
-        rptCheck.isChecked = p.includeReportId
         autoCheck.isChecked = p.autoEnabled
         screenCheck.isChecked = p.onlyWhenScreenOn
     }
@@ -432,7 +423,6 @@ class MainActivity : Activity() {
         p.serviceUuid = svcEdit.text.toString().trim()
         p.featureIndex = featEdit.text.toString().trim().toIntOrNull(16) ?: 0
         p.targetHost = hostEdit.text.toString().trim().toIntOrNull()?.coerceIn(0, 2) ?: 0
-        p.includeReportId = rptCheck.isChecked
         p.onlyWhenScreenOn = screenCheck.isChecked
 
         bonded.getOrNull(kbSpinner.selectedItemPosition)?.let { p.keyboardMac = it.address }
@@ -481,8 +471,6 @@ class MainActivity : Activity() {
             }
         }
     }
-
-    private fun doProbeFeature() = doSweep()
 
     /**
      * 확정된 BLE 프레이밍으로 ChangeHost feature index 를 조회한다.

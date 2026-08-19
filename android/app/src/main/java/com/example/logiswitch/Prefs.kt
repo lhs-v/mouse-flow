@@ -32,11 +32,6 @@ class Prefs(ctx: Context) {
         get() = sp.getString("nchar", "") ?: ""
         set(v) = sp.edit().putString("nchar", v).apply()
 
-    /** 페이로드 첫 바이트로 리포트 ID(0x11)를 포함할지. 둘 다 시도해 볼 것. */
-    var includeReportId: Boolean
-        get() = sp.getBoolean("rptId", true)
-        set(v) = sp.edit().putBoolean("rptId", v).apply()
-
     /** 0x1814 의 feature index. 0 이면 실행 시 자동 조회 후 캐시된다. */
     var featureIndex: Int
         get() = sp.getInt("feat", 0)
