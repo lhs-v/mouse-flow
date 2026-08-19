@@ -282,13 +282,19 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
 
         log("  TX  ${Hidpp.hex(payload)}")
-        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(c, payload, type) == BluetoothStatusCodes.SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run { c.writeType = type; c.value = payload; g.writeCharacteristic(c) }
+        val started = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val rc = g.writeCharacteristic(c, payload, type)
+                if (rc != BluetoothStatusCodes.SUCCESS) log("  writeCharacteristic 거부 rc=$rc")
+                rc == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                run { c.writeType = type; c.value = payload; g.writeCharacteristic(c) }
+            }
+        } catch (e: Exception) {
+            log("  write 예외: ${e.javaClass.simpleName}: ${e.message}"); false
         }
-        if (!started) { log("  write 호출 거부됨"); return null }
+        if (!started) return null
 
         if (type == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) {
             val st = writeAckQ.poll(3000, TimeUnit.MILLISECONDS)
@@ -312,7 +318,10 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         val c = g.getService(serviceUuid)?.getCharacteristic(charUuid) ?: return null
         if (c.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) return null
         readQ.clear()
-        if (!g.readCharacteristic(c)) { log("  read 호출 거부됨: $charUuid"); return null }
+        val ok = try { g.readCharacteristic(c) } catch (e: Exception) {
+            log("  read 예외: ${e.javaClass.simpleName}"); false
+        }
+        if (!ok) { log("  read 호출 거부됨: $charUuid"); return null }
         val r = readQ.poll(timeoutMs, TimeUnit.MILLISECONDS)
         if (r == null) { log("  read 응답 없음"); return null }
         if (r.first != BluetoothGatt.GATT_SUCCESS) { log("  read 실패 status=${r.first}"); return null }
@@ -332,8 +341,16 @@ class HidppBle(private val ctx: Context, private val log: (String) -> Unit) {
         }
         if (target == null) { log("HID 서비스에 읽을 특성 없음"); return }
         readQ.clear()
-        val started = g.readCharacteristic(target)
-        if (!started) { log("HID 서비스 접근: 차단됨 (read 호출 자체를 거부)"); return }
+        val started = try {
+            g.readCharacteristic(target)
+        } catch (e: SecurityException) {
+            log("HID 서비스 접근: 차단됨 (BLUETOOTH_PRIVILEGED 필요) — 예상된 결과")
+            return
+        } catch (e: Exception) {
+            log("HID 서비스 접근: 예외 ${e.javaClass.simpleName}")
+            return
+        }
+        if (!started) { log("HID 서비스 접근: 차단됨 (read 호출 거부)"); return }
         val r = readQ.poll(2500, TimeUnit.MILLISECONDS)
         when {
             r == null -> log("HID 서비스 접근: 응답 없음")

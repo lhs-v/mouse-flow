@@ -305,7 +305,9 @@ class MainActivity : Activity() {
 
                 log("")
                 log("=== HID 서비스 접근 가능 여부 ===")
-                ble.probeHidService()
+                try { ble.probeHidService() } catch (e: Exception) {
+                    log("HID 서비스 접근: 차단됨 (${e.javaClass.simpleName})")
+                }
 
                 val vendorChar = w ?: ble.characteristicsOf(svc).firstOrNull()?.uuid
                 if (vendorChar != null) {
@@ -341,11 +343,13 @@ class MainActivity : Activity() {
                                     isLong, withId
                                 )
 
-                                var resp = ble.request(pkt, 1200, wt)
+                                var resp = try { ble.request(pkt, 1200, wt) } catch (e: Exception) {
+                                    log("  예외: ${e.javaClass.simpleName}"); null
+                                }
 
                                 // 알림이 안 오면 특성을 읽어서 응답이 거기 있는지 본다
                                 if (resp == null && vendorChar != null) {
-                                    val rd = ble.read(svc, vendorChar, 1200)
+                                    val rd = try { ble.read(svc, vendorChar, 1200) } catch (e: Exception) { null }
                                     if (rd != null && rd.any { it.toInt() != 0 }) {
                                         log("  READ  ${Hidpp.hex(rd)}")
                                         resp = rd
