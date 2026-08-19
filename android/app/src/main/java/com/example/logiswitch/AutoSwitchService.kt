@@ -164,6 +164,15 @@ class AutoSwitchService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
+    /**
+     * 최근 앱 목록에서 밀어 제거해도 포그라운드 서비스는 살아 있어야 한다.
+     * 제조사에 따라 강제로 죽이는 경우가 있어 기록을 남긴다.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        EventLog.add(this, "앱을 최근 목록에서 제거함 — 감시는 계속됩니다")
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         EventLog.add(this, "== 감시 서비스 종료 ==")
         handler.removeCallbacks(poller)
