@@ -13,7 +13,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import java.util.concurrent.Executors
@@ -30,6 +34,68 @@ class AutoSwitchService : Service() {
     private val io = Executors.newSingleThreadExecutor()
     private var lastFireAt = 0L
     private var busy = false
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastConnected: Boolean? = null
+
+    /**
+     * 브로드캐스트가 안 올 수도 있으므로 연결 상태를 직접 확인한다.
+     * 두 가지 방법을 모두 읽어서 어느 쪽이 실제를 반영하는지 기록으로 남긴다.
+     *   A: BluetoothManager.getConnectedDevices(GATT)  - 공개 API
+     *   B: BluetoothDevice.isConnected()               - 숨은 API, 막힐 수 있음
+     */
+    @SuppressLint("MissingPermission")
+    private fun readKeyboardState(): Triple<Boolean?, Boolean?, Boolean?> {
+        val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val mac = p.keyboardMac
+
+        val a: Boolean? = try {
+            mgr?.getConnectedDevices(BluetoothProfile.GATT)
+                ?.any { it.address.equals(mac, ignoreCase = true) }
+        } catch (e: Exception) { null }
+
+        val b: Boolean? = try {
+            val dev = mgr?.adapter?.getRemoteDevice(mac)
+            val m = android.bluetooth.BluetoothDevice::class.java.getMethod("isConnected")
+            m.invoke(dev) as? Boolean
+        } catch (e: Exception) { null }
+
+        val eff = b ?: a
+        return Triple(a, b, eff)
+    }
+
+    private val poller = object : Runnable {
+        override fun run() {
+            try { pollOnce() } catch (e: Exception) {
+                EventLog.add(this@AutoSwitchService, "폴링 예외: " + e.message)
+            }
+            handler.postDelayed(this, 1500)
+        }
+    }
+
+    private fun pollOnce() {
+        if (p.keyboardMac.isBlank()) return
+        val (a, b, eff) = readKeyboardState()
+        if (eff == null) return
+
+        if (lastConnected == null) {
+            lastConnected = eff
+            EventLog.add(this, "폴링 시작 상태: " + (if (eff) "연결됨" else "끊김") +
+                    "  (GATT목록=" + a + " isConnected=" + b + ")")
+            return
+        }
+        if (lastConnected == true && !eff) {
+            EventLog.add(this, "폴링 감지: 키보드 끊김  (GATT목록=" + a + " isConnected=" + b + ")")
+            lastConnected = false
+            onKeyboardGone()
+            return
+        }
+        if (lastConnected == false && eff) {
+            EventLog.add(this, "폴링 감지: 키보드 다시 연결됨")
+        }
+        lastConnected = eff
+    }
+
 
     @SuppressLint("MissingPermission")
     private val receiver = object : BroadcastReceiver() {
@@ -88,12 +154,14 @@ class AutoSwitchService : Service() {
             registerReceiver(receiver, filter)
         }
         EventLog.add(this, "== 감시 서비스 시작 == 대상 키보드 ${p.keyboardMac}, host=${p.targetHost}")
+        handler.post(poller)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         EventLog.add(this, "== 감시 서비스 종료 ==")
+        handler.removeCallbacks(poller)
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
         io.shutdownNow()
         super.onDestroy()

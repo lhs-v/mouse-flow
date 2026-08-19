@@ -70,6 +70,22 @@ class MainActivity : Activity() {
         loadBonded()
         restore()
         log("준비됨. 마우스를 폰 채널로 켜고 [연결 + 서비스 탐색] 을 누르세요.")
+        showServiceLog()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        showServiceLog()
+    }
+
+    /** 자동 전환은 화면을 안 보는 사이에 일어나므로, 열 때마다 기록을 먼저 보여준다. */
+    private fun showServiceLog() {
+        val t = EventLog.read(this)
+        log("")
+        log("=== 백그라운드 서비스 기록 ===")
+        log(if (t.isBlank()) "(기록 없음)" else t.trim())
+        log("=== 기록 끝 ===")
+        log("")
     }
 
     // ------------------------------------------------------------------ UI
