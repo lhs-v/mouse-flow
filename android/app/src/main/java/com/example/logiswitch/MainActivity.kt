@@ -246,46 +246,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun doProbeFeature() {
-        persist()
-        io.execute {
-            val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: return@execute
-            val ble = HidppBle(this) { log(it) }
-            try {
-                if (!ble.connect(adapter.getRemoteDevice(p.mouseMac))) return@execute
-                val svc = UUID.fromString(p.serviceUuid)
-                val w = p.writeCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
-                val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
-                if (!ble.bind(svc, w, n)) return@execute
-
-                val resp = ble.request(Hidpp.rootGetFeature(Hidpp.FEATURE_CHANGE_HOST, p.includeReportId), 2500)
-                if (resp == null) {
-                    log("응답 없음. 알림 특성을 바꾸거나 Report ID 체크를 반대로 해보세요.")
-                    return@execute
-                }
-                val nrm = Hidpp.normalize(resp)
-                if (Hidpp.isError(nrm)) { log("오류 응답 code=${Hidpp.errorCode(nrm)}"); return@execute }
-                val feat = nrm.getOrNull(3)?.toInt()?.and(0xFF) ?: 0
-                if (feat == 0) { log("이 기기는 0x1814 를 지원하지 않는다고 응답했습니다"); return@execute }
-
-                p.featureIndex = feat
-                log("성공! ChangeHost feature index = 0x%02X".format(feat))
-                runOnUiThread { featEdit.setText("%02X".format(feat)) }
-            } catch (e: Exception) {
-                log("예외: ${e.message}")
-            } finally {
-                ble.close()
-            }
-        }
-    }
+    private fun doProbeFeature() = doSweep()
 
     /**
-     * 1단계: 어떤 쓰기 길이를 받아주는지 찾는다 (status 13 = INVALID_ATTRIBUTE_LENGTH).
-     * 2단계: 받아주는 길이에 대해서만 프레이밍 조합을 시도한다.
-     *
-     * 응답 판정은 엄격하게 한다. 쓰기가 실패했으면 응답을 볼 것도 없고,
-     * 특성 read 는 쓰기 전 기준값과 "달라졌을 때"만 응답으로 인정한다.
-     * (기준값을 응답으로 오해해서 가짜 feature index 를 잡은 적이 있다)
+     * 확정된 BLE 프레이밍으로 ChangeHost feature index 를 조회한다.
+     * 실패하면 진단에 필요한 응답을 그대로 보여준다.
      */
     private fun doSweep() {
         persist()
@@ -300,106 +265,42 @@ class MainActivity : Activity() {
             val ble = HidppBle(this) { log(it) }
             try {
                 if (!ble.connect(adapter.getRemoteDevice(p.mouseMac))) return@execute
-                ble.negotiateMtu(247)
 
                 val svc = UUID.fromString(p.serviceUuid)
                 val w = p.writeCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 val n = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let { UUID.fromString(it) }
                 if (!ble.bind(svc, w, n)) return@execute
 
-                val vendorChar = w ?: ble.characteristicsOf(svc).firstOrNull()?.uuid
-                val baseline = vendorChar?.let { ble.read(svc, it) }
                 log("")
-                log("기준값(쓰기 전): " + (baseline?.let { Hidpp.hex(it) } ?: "(읽기 실패)"))
-                log("기준값 길이: ${baseline?.size ?: -1} 바이트")
+                log("=== ChangeHost(0x1814) feature index 조회 ===")
+                log("프레임: [featIdx][fn|sw][params...] 18바이트")
 
-                // ---------- 1단계: 허용되는 쓰기 길이 찾기 ----------
-                log("")
-                log("=== 1단계: 허용 쓰기 길이 탐색 ===")
-                val accepted = ArrayList<Int>()
-                for (len in 2..20) {
-                    val probe = ByteArray(len)
-                    val src = Hidpp.packet(0xFF, 0x00, 0x00,
-                        intArrayOf((Hidpp.FEATURE_CHANGE_HOST shr 8) and 0xFF,
-                                   Hidpp.FEATURE_CHANGE_HOST and 0xFF), true, true)
-                    for (i in 0 until minOf(len, src.size)) probe[i] = src[i]
+                val resp = ble.request(Hidpp.bleGetFeature(Hidpp.FEATURE_CHANGE_HOST), 2500)
+                if (resp == null) { log("응답 없음"); return@execute }
 
-                    try { ble.request(probe, 0) } catch (e: Exception) { }
-                    val st = ble.lastWriteStatus
-                    if (st == 0) { accepted.add(len); log("  길이 $len : 허용") }
-                    else if (st != 13) log("  길이 $len : status=$st")
-                    Thread.sleep(120)
-                }
-
-                if (accepted.isEmpty()) {
-                    log("")
-                    log("2~20 바이트 중 허용되는 길이가 없습니다.")
-                    log("이 특성은 HID++ 명령 통로가 아닐 가능성이 큽니다.")
+                if (Hidpp.bleIsError(resp)) {
+                    log("오류 응답: ${Hidpp.errName(Hidpp.bleErrorCode(resp))}")
+                    log("  (반사된 featIdx=0x%02X fn|sw=0x%02X)".format(
+                        resp[1].toInt() and 0xFF, resp[2].toInt() and 0xFF))
                     return@execute
                 }
-                log("허용 길이: ${accepted.joinToString(", ")}")
 
-                // ---------- 2단계: 허용 길이에서만 프레이밍 시도 ----------
-                log("")
-                log("=== 2단계: 프레이밍 조합 ===")
-                var hit = false
+                val feat = Hidpp.bleParam(resp, 0)
+                val type = Hidpp.bleParam(resp, 1)
+                val ver  = Hidpp.bleParam(resp, 2)
+                if (feat <= 0) { log("0x1814 미지원으로 응답됨 (featIdx=0)"); return@execute }
 
-                for (len in accepted) {
-                    for (devIdx in intArrayOf(0xFF, 0x01)) {
-                        for (withId in booleanArrayOf(true, false)) {
-                            if (hit) continue
-                            val label = "len=$len devIdx=0x%02X rptId=%s".format(devIdx, withId)
+                log("★★ ChangeHost feature index = 0x%02X  (type=0x%02X ver=%d)".format(feat, type, ver))
+                p.featureIndex = feat
+                runOnUiThread { featEdit.setText("%02X".format(feat)) }
 
-                            val src = Hidpp.packet(devIdx, 0x00, 0x00,
-                                intArrayOf((Hidpp.FEATURE_CHANGE_HOST shr 8) and 0xFF,
-                                           Hidpp.FEATURE_CHANGE_HOST and 0xFF), true, withId)
-                            val pkt = ByteArray(len)
-                            for (i in 0 until minOf(len, src.size)) pkt[i] = src[i]
-
-                            log("-- $label")
-                            var resp = try { ble.request(pkt, 1500) } catch (e: Exception) { null }
-
-                            // 쓰기가 실패했으면 응답을 볼 이유가 없다
-                            if (ble.lastWriteStatus != 0) continue
-
-                            // 알림이 없으면 read 로 확인하되, 기준값과 달라야 응답이다
-                            if (resp == null && vendorChar != null) {
-                                val rd = try { ble.read(svc, vendorChar, 1200) } catch (e: Exception) { null }
-                                if (rd != null && baseline != null && !rd.contentEquals(baseline)) {
-                                    log("  READ 변화: ${Hidpp.hex(rd)}")
-                                    resp = rd
-                                }
-                            }
-
-                            if (resp == null) { log("  쓰기 성공, 응답 없음"); continue }
-
-                            val nrm = Hidpp.normalize(resp)
-                            if (Hidpp.isError(nrm)) {
-                                log("  ★ 오류 응답 code=${Hidpp.errorCode(nrm)} — 프레이밍 정답, 요청 내용만 틀림")
-                                continue
-                            }
-                            val feat = nrm.getOrNull(3)?.toInt()?.and(0xFF) ?: 0
-                            if (feat != 0) {
-                                log("  ★★ 성공!  $label")
-                                log("     ChangeHost feature index = 0x%02X".format(feat))
-                                p.featureIndex = feat
-                                p.includeReportId = withId
-                                hit = true
-                                runOnUiThread {
-                                    featEdit.setText("%02X".format(feat))
-                                    rptCheck.isChecked = withId
-                                }
-                            }
-                        }
-                    }
+                val info = ble.request(Hidpp.bleGetHostInfo(feat), 2000)
+                if (info != null && !Hidpp.bleIsError(info)) {
+                    log("호스트 수=${Hidpp.bleParam(info, 0)}  현재=${Hidpp.bleParam(info, 1)} (0-based)")
                 }
 
                 log("")
-                if (hit) log("성공. 이제 [지금 전환] 을 누르세요.")
-                else {
-                    log("쓰기는 통했지만 응답이 없습니다.")
-                    log("허용 길이(${accepted.joinToString(",")})와 기준값을 알려주세요.")
-                }
+                log("이제 [지금 전환] 을 누르세요.")
             } catch (e: Exception) {
                 log("예외: ${e.message}")
             } finally {

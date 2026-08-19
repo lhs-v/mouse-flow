@@ -61,6 +61,53 @@ object Hidpp {
     fun report(devIdx: Int, featIdx: Int, funcId: Int, params: IntArray, includeReportId: Boolean): ByteArray =
         packet(devIdx, featIdx, funcId, params, true, includeReportId)
 
+    // ---------------------------------------------------------------- BLE 프레이밍
+    //
+    // 실기 확인 결과, 로지텍 벤더 GATT 특성은 리포트 ID 도 장치 인덱스도 받지 않는다.
+    // 프레임은 18바이트 고정이며 (20바이트 long report 에서 앞 2바이트를 뺀 것)
+    //
+    //     [0] featureIndex
+    //     [1] (funcId shl 4) or swId
+    //     [2..17] parameters
+    //
+    // 오류 응답은 HID++ 2.0 규격 그대로 featureIndex 자리에 0xFF 가 온다.
+    //
+    //     [0] 0xFF   [1] 원래 featureIndex   [2] 원래 fn|sw   [3] errorCode
+    //
+    // 근거: `11 FF` 를 쓰면 `FF 11 FF 07`, `10 FF ..` 를 쓰면 `FF 10 FF 07` 이 돌아온다.
+    // 보낸 두 바이트가 [1],[2] 에 그대로 반사되고 07 = INVALID_FUNCTION_ID 다.
+
+    const val BLE_FRAME_LEN = 18
+
+    fun bleFrame(featIdx: Int, funcId: Int, params: IntArray): ByteArray {
+        val b = ByteArray(BLE_FRAME_LEN)
+        b[0] = (featIdx and 0xFF).toByte()
+        b[1] = (((funcId and 0x0F) shl 4) or (SW_ID and 0x0F)).toByte()
+        for (i in params.indices) if (2 + i < BLE_FRAME_LEN) b[2 + i] = (params[i] and 0xFF).toByte()
+        return b
+    }
+
+    fun bleGetFeature(featureId: Int): ByteArray =
+        bleFrame(0x00, 0x00, intArrayOf((featureId shr 8) and 0xFF, featureId and 0xFF))
+
+    fun bleSetCurrentHost(featIdx: Int, hostIndex: Int): ByteArray =
+        bleFrame(featIdx, 0x01, intArrayOf(hostIndex))
+
+    fun bleGetHostInfo(featIdx: Int): ByteArray = bleFrame(featIdx, 0x00, intArrayOf())
+
+    fun bleIsError(r: ByteArray): Boolean = r.size >= 4 && (r[0].toInt() and 0xFF) == 0xFF
+    fun bleErrorCode(r: ByteArray): Int = if (r.size >= 4) r[3].toInt() and 0xFF else -1
+
+    /** 정상 응답의 n 번째 파라미터 */
+    fun bleParam(r: ByteArray, i: Int): Int = r.getOrNull(2 + i)?.toInt()?.and(0xFF) ?: -1
+
+    fun errName(code: Int): String = when (code) {
+        1 -> "Unknown"; 2 -> "InvalidArgument"; 3 -> "OutOfRange"
+        4 -> "HWError"; 5 -> "LogitechInternal"; 6 -> "InvalidFeatureIndex"
+        7 -> "InvalidFunctionID"; 8 -> "Busy"; 9 -> "Unsupported"
+        else -> "code=$code"
+    }
+
     /** Root(0x0000).getFeature(featureId) */
     fun rootGetFeature(featureId: Int, includeReportId: Boolean): ByteArray =
         report(DEV_INDEX_BLE, 0x00, 0x00,
@@ -421,41 +468,46 @@ object SwitchOp {
 
         val mac = p.mouseMac
         if (mac.isBlank()) { log("마우스를 먼저 선택하세요"); return false }
-
         val dev = try { adapter.getRemoteDevice(mac) } catch (e: Exception) { log("MAC 오류: $mac"); return false }
 
         val ble = HidppBle(ctx, log)
         try {
             if (!ble.connect(dev)) return false
 
-            val svcUuid = try { UUID.fromString(p.serviceUuid) } catch (e: Exception) { log("서비스 UUID 형식 오류"); return false }
-            // 비워두면 bind() 가 서비스 안에서 자동으로 고른다
+            val svcUuid = try { UUID.fromString(p.serviceUuid) } catch (e: Exception) {
+                log("서비스 UUID 형식 오류"); return false
+            }
             val wUuid = p.writeCharUuid.takeIf { it.isNotBlank() }?.let {
                 try { UUID.fromString(it) } catch (e: Exception) { null }
             }
             val nUuid = p.notifyCharUuid.takeIf { it.isNotBlank() }?.let {
                 try { UUID.fromString(it) } catch (e: Exception) { null }
             }
-
             if (!ble.bind(svcUuid, wUuid, nUuid)) return false
 
-            // feature index 확보
+            // ChangeHost 의 feature index 확보
             var feat = p.featureIndex
             if (feat <= 0) {
                 log("ChangeHost feature index 조회 중...")
-                val resp = ble.request(Hidpp.rootGetFeature(Hidpp.FEATURE_CHANGE_HOST, p.includeReportId), 2000)
-                if (resp == null) { log("조회 응답 없음 — 알림 특성 설정 또는 Report ID 옵션을 바꿔보세요"); return false }
-                val n = Hidpp.normalize(resp)
-                if (Hidpp.isError(n)) { log("오류 응답 (code=${Hidpp.errorCode(n)})"); return false }
-                feat = n.getOrNull(3)?.toInt()?.and(0xFF) ?: 0
-                if (feat == 0) { log("0x1814 미지원으로 응답됨"); return false }
+                val resp = ble.request(Hidpp.bleGetFeature(Hidpp.FEATURE_CHANGE_HOST), 2500)
+                if (resp == null) { log("조회 응답 없음"); return false }
+                if (Hidpp.bleIsError(resp)) {
+                    log("조회 오류: ${Hidpp.errName(Hidpp.bleErrorCode(resp))}")
+                    return false
+                }
+                feat = Hidpp.bleParam(resp, 0)
+                if (feat <= 0) { log("이 기기는 0x1814 를 지원하지 않습니다"); return false }
                 log("feature index = 0x%02X".format(feat))
                 p.featureIndex = feat
             }
 
             log("ChangeHost(host=${p.targetHost}) 전송")
-            ble.request(Hidpp.setCurrentHost(feat, p.targetHost, p.includeReportId), 0)
-            log("전송 완료 — 성공하면 마우스가 즉시 다른 호스트로 넘어갑니다")
+            val r = ble.request(Hidpp.bleSetCurrentHost(feat, p.targetHost), 800)
+            if (r != null && Hidpp.bleIsError(r)) {
+                log("거부됨: ${Hidpp.errName(Hidpp.bleErrorCode(r))}")
+                return false
+            }
+            log("전송 완료 — 마우스가 넘어갔는지 확인하세요")
             return true
         } catch (e: Exception) {
             log("예외: ${e.message}")
