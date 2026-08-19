@@ -153,6 +153,11 @@ class AutoSwitchService : Service() {
         } else {
             registerReceiver(receiver, filter)
         }
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try { EventLog.add(this, "!! 처리되지 않은 예외 [" + t.name + "] " + e) } catch (x: Throwable) { }
+            prev?.uncaughtException(t, e)
+        }
         EventLog.add(this, "== 감시 서비스 시작 == 대상 키보드 ${p.keyboardMac}, host=${p.targetHost}")
         handler.post(poller)
     }
@@ -195,25 +200,41 @@ class AutoSwitchService : Service() {
         notify("키보드 끊김 감지 — 마우스 전환 중")
 
         io.execute {
-            // 화면이 꺼진 상태에서 GATT 작업이 잘리지 않도록 잠깐 깨워 둔다
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LogiSwitch:switch")
+            // 백그라운드 스레드에서 던져진 예외는 프로세스를 죽인다.
+            // 자동 전환은 사용자가 화면을 안 보는 중에 돌아가므로 무엇도 새어나가면 안 된다.
             try {
-                wl.acquire(30_000L)
-                val ok = try {
-                    SwitchOp.run(this@AutoSwitchService, p) { line ->
-                        EventLog.add(this@AutoSwitchService, "    " + line)
-                    }
-                } catch (e: Exception) {
-                    EventLog.add(this@AutoSwitchService, "    예외: " + e.message)
-                    false
-                }
-                EventLog.add(this@AutoSwitchService, "  결과: " + (if (ok) "성공" else "실패"))
-                notify(if (ok) "전환 명령 전송됨" else "전환 실패 — 앱에서 로그 확인")
+                runSwitch()
+            } catch (t: Throwable) {
+                EventLog.add(this@AutoSwitchService, "  치명적 예외: " + t.javaClass.simpleName + ": " + t.message)
             } finally {
                 busy = false
-                try { if (wl.isHeld) wl.release() } catch (e: Exception) { }
             }
+        }
+    }
+
+    private fun runSwitch() {
+        // wakelock 은 있으면 좋고 없어도 진행한다. 권한이 없으면 예외가 난다.
+        var wl: PowerManager.WakeLock? = null
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LogiSwitch:switch")
+            wl.acquire(30_000L)
+        } catch (e: Exception) {
+            EventLog.add(this, "  wakelock 실패(무시하고 진행): " + e.javaClass.simpleName)
+            wl = null
+        }
+
+        try {
+            val ok = try {
+                SwitchOp.run(this, p) { line -> EventLog.add(this, "    " + line) }
+            } catch (e: Exception) {
+                EventLog.add(this, "    예외: " + e.javaClass.simpleName + ": " + e.message)
+                false
+            }
+            EventLog.add(this, "  결과: " + (if (ok) "성공" else "실패"))
+            notify(if (ok) "전환 명령 전송됨" else "전환 실패 — 앱에서 기록 확인")
+        } finally {
+            try { if (wl != null && wl.isHeld) wl.release() } catch (e: Exception) { }
         }
     }
 
